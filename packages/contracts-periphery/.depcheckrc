@@ -7,7 +7,7 @@ ignores: [
   "@rari-capital/solmate",
   "@types/node",
   "hardhat-deploy",
-  "ts-node",
+  "tsx",
   "typescript",
   "prettier-plugin-solidity",
   "solhint-plugin-prettier",
