@@ -1,16 +1,18 @@
 package metrics
 
 import (
-	"context"
+	"io"
+	"sync/atomic"
+
+	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/ethereum/go-ethereum/log"
-	"github.com/prometheus/client_golang/prometheus"
 
-	"github.com/ethereum-optimism/optimism/op-node/eth"
 	"github.com/ethereum-optimism/optimism/op-node/rollup/derive"
+	"github.com/ethereum-optimism/optimism/op-service/eth"
 	opmetrics "github.com/ethereum-optimism/optimism/op-service/metrics"
 	txmetrics "github.com/ethereum-optimism/optimism/op-service/txmgr/metrics"
 )
@@ -27,6 +29,10 @@ type Metricer interface {
 	// Record Tx metrics
 	txmetrics.TxMetricer
 
+	opmetrics.RPCMetricer
+
+	StartBalanceMetrics(l log.Logger, client *ethclient.Client, account common.Address) io.Closer
+
 	RecordLatestL1Block(l1ref eth.L1BlockRef)
 	RecordL2BlocksLoaded(l2ref eth.L2BlockRef)
 	RecordChannelOpened(id derive.ChannelID, numPendingBlocks int)
@@ -41,7 +47,11 @@ type Metricer interface {
 	RecordBatchTxSuccess()
 	RecordBatchTxFailed()
 
+	RecordBlobUsedBytes(num int)
+
 	Document() []opmetrics.DocumentedMetric
+
+	PendingDABytes() float64
 }
 
 type Metrics struct {
@@ -51,17 +61,22 @@ type Metrics struct {
 
 	opmetrics.RefMetrics
 	txmetrics.TxMetrics
+	opmetrics.RPCMetrics
 
 	info prometheus.GaugeVec
 	up   prometheus.Gauge
 
-	// label by openend, closed, fully_submitted, timed_out
+	// label by opened, closed, fully_submitted, timed_out
 	channelEvs opmetrics.EventVec
 
 	pendingBlocksCount        prometheus.GaugeVec
 	pendingBlocksBytesTotal   prometheus.Counter
 	pendingBlocksBytesCurrent prometheus.Gauge
-	blocksAddedCount          prometheus.Gauge
+
+	pendingDABytes          int64
+	pendingDABytesGaugeFunc prometheus.GaugeFunc
+
+	blocksAddedCount prometheus.Gauge
 
 	channelInputBytes       prometheus.GaugeVec
 	channelReadyBytes       prometheus.Gauge
@@ -73,9 +88,14 @@ type Metrics struct {
 	channelOutputBytesTotal prometheus.Counter
 
 	batcherTxEvs opmetrics.EventVec
+
+	blobUsedBytes prometheus.Histogram
 }
 
 var _ Metricer = (*Metrics)(nil)
+
+// implements the Registry getter, for metrics HTTP server to hook into
+var _ opmetrics.RegistryMetricer = (*Metrics)(nil)
 
 func NewMetrics(procName string) *Metrics {
 	if procName == "" {
@@ -86,13 +106,14 @@ func NewMetrics(procName string) *Metrics {
 	registry := opmetrics.NewRegistry()
 	factory := opmetrics.With(registry)
 
-	return &Metrics{
+	m := &Metrics{
 		ns:       ns,
 		registry: registry,
 		factory:  factory,
 
 		RefMetrics: opmetrics.MakeRefMetrics(ns, factory),
 		TxMetrics:  txmetrics.MakeTxMetrics(ns, factory),
+		RPCMetrics: opmetrics.MakeRPCMetrics(ns, factory),
 
 		info: *factory.NewGaugeVec(prometheus.GaugeOpts{
 			Namespace: ns,
@@ -129,7 +150,6 @@ func NewMetrics(procName string) *Metrics {
 			Name:      "blocks_added_count",
 			Help:      "Total number of blocks added to current channel.",
 		}),
-
 		channelInputBytes: *factory.NewGaugeVec(prometheus.GaugeOpts{
 			Namespace: ns,
 			Name:      "input_bytes",
@@ -171,22 +191,40 @@ func NewMetrics(procName string) *Metrics {
 			Name:      "output_bytes_total",
 			Help:      "Total number of compressed output bytes from a channel.",
 		}),
+		blobUsedBytes: factory.NewHistogram(prometheus.HistogramOpts{
+			Namespace: ns,
+			Name:      "blob_used_bytes",
+			Help:      "Blob size in bytes (of last blob only for multi-blob txs).",
+			Buckets:   prometheus.LinearBuckets(0.0, eth.MaxBlobDataSize/13, 14),
+		}),
 
 		batcherTxEvs: opmetrics.NewEventVec(factory, ns, "", "batcher_tx", "BatcherTx", []string{"stage"}),
 	}
+	m.pendingDABytesGaugeFunc = factory.NewGaugeFunc(prometheus.GaugeOpts{
+		Namespace: ns,
+		Name:      "pending_da_bytes",
+		Help:      "The estimated amount of data currently pending to be written to the DA layer (from blocks fetched from L2 but not yet in a channel).",
+	}, m.PendingDABytes)
+
+	return m
 }
 
-func (m *Metrics) Serve(ctx context.Context, host string, port int) error {
-	return opmetrics.ListenAndServe(ctx, m.registry, host, port)
+func (m *Metrics) Registry() *prometheus.Registry {
+	return m.registry
 }
 
 func (m *Metrics) Document() []opmetrics.DocumentedMetric {
 	return m.factory.Document()
 }
 
-func (m *Metrics) StartBalanceMetrics(ctx context.Context,
-	l log.Logger, client *ethclient.Client, account common.Address) {
-	opmetrics.LaunchBalanceMetrics(ctx, l, m.registry, m.ns, client, account)
+// PendingDABytes returns the current number of bytes pending to be written to the DA layer (from blocks fetched from L2
+// but not yet in a channel).
+func (m *Metrics) PendingDABytes() float64 {
+	return float64(atomic.LoadInt64(&m.pendingDABytes))
+}
+
+func (m *Metrics) StartBalanceMetrics(l log.Logger, client *ethclient.Client, account common.Address) io.Closer {
+	return opmetrics.LaunchBalanceMetrics(l, m.registry, m.ns, client, account)
 }
 
 // RecordInfo sets a pseudo-metric that contains versioning and
@@ -259,14 +297,16 @@ func (m *Metrics) RecordChannelClosed(id derive.ChannelID, numPendingBlocks int,
 }
 
 func (m *Metrics) RecordL2BlockInPendingQueue(block *types.Block) {
-	size := float64(estimateBatchSize(block))
-	m.pendingBlocksBytesTotal.Add(size)
-	m.pendingBlocksBytesCurrent.Add(size)
+	daSize, rawSize := estimateBatchSize(block)
+	m.pendingBlocksBytesTotal.Add(float64(rawSize))
+	m.pendingBlocksBytesCurrent.Add(float64(rawSize))
+	atomic.AddInt64(&m.pendingDABytes, int64(daSize))
 }
 
 func (m *Metrics) RecordL2BlockInChannel(block *types.Block) {
-	size := float64(estimateBatchSize(block))
-	m.pendingBlocksBytesCurrent.Add(-1 * size)
+	daSize, rawSize := estimateBatchSize(block)
+	m.pendingBlocksBytesCurrent.Add(-1.0 * float64(rawSize))
+	atomic.AddInt64(&m.pendingDABytes, -1*int64(daSize))
 	// Refer to RecordL2BlocksAdded to see the current + count of bytes added to a channel
 }
 
@@ -295,16 +335,26 @@ func (m *Metrics) RecordBatchTxFailed() {
 	m.batcherTxEvs.Record(TxStageFailed)
 }
 
-// estimateBatchSize estimates the size of the batch
-func estimateBatchSize(block *types.Block) uint64 {
-	size := uint64(70) // estimated overhead of batch metadata
+func (m *Metrics) RecordBlobUsedBytes(num int) {
+	m.blobUsedBytes.Observe(float64(num))
+}
+
+// estimateBatchSize returns the estimated size of the block in a batch both with compression ('daSize') and without
+// ('rawSize').
+func estimateBatchSize(block *types.Block) (daSize, rawSize uint64) {
+	daSize = uint64(70) // estimated overhead of batch metadata
+	rawSize = uint64(70)
 	for _, tx := range block.Transactions() {
-		// Don't include deposit transactions in the batch.
+		// Deposit transactions are not included in batches
 		if tx.IsDepositTx() {
 			continue
 		}
+		bigSize := tx.RollupCostData().EstimatedDASize()
+		if bigSize.IsUint64() { // this should always be true, but if not just ignore
+			daSize += bigSize.Uint64()
+		}
 		// Add 2 for the overhead of encoding the tx bytes in a RLP list
-		size += tx.Size() + 2
+		rawSize += tx.Size() + 2
 	}
-	return size
+	return
 }

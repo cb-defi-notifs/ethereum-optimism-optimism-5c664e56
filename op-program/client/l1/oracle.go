@@ -1,15 +1,18 @@
 package l1
 
 import (
+	"encoding/binary"
 	"fmt"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rlp"
 
-	"github.com/ethereum-optimism/optimism/op-node/eth"
 	preimage "github.com/ethereum-optimism/optimism/op-preimage"
 	"github.com/ethereum-optimism/optimism/op-program/client/mpt"
+	"github.com/ethereum-optimism/optimism/op-service/eth"
 )
 
 type Oracle interface {
@@ -21,6 +24,12 @@ type Oracle interface {
 
 	// ReceiptsByBlockHash retrieves the receipts from the block with the given hash.
 	ReceiptsByBlockHash(blockHash common.Hash) (eth.BlockInfo, types.Receipts)
+
+	// GetBlob retrieves the blob with the given hash.
+	GetBlob(ref eth.L1BlockRef, blobHash eth.IndexedBlobHash) *eth.Blob
+
+	// Precompile retrieves the result and success indicator of a precompile call for the given input.
+	Precompile(precompileAddress common.Address, input []byte, requiredGas uint64) ([]byte, bool)
 }
 
 // PreimageOracle implements Oracle using by interfacing with the pure preimage.Oracle
@@ -50,7 +59,7 @@ func (p *PreimageOracle) headerByBlockHash(blockHash common.Hash) *types.Header 
 }
 
 func (p *PreimageOracle) HeaderByBlockHash(blockHash common.Hash) eth.BlockInfo {
-	return eth.HeaderBlockInfo(p.headerByBlockHash(blockHash))
+	return eth.HeaderBlockInfoTrusted(blockHash, p.headerByBlockHash(blockHash))
 }
 
 func (p *PreimageOracle) TransactionsByBlockHash(blockHash common.Hash) (eth.BlockInfo, types.Transactions) {
@@ -66,7 +75,7 @@ func (p *PreimageOracle) TransactionsByBlockHash(blockHash common.Hash) (eth.Blo
 		panic(fmt.Errorf("failed to decode list of txs: %w", err))
 	}
 
-	return eth.HeaderBlockInfo(header), txs
+	return eth.HeaderBlockInfoTrusted(blockHash, header), txs
 }
 
 func (p *PreimageOracle) ReceiptsByBlockHash(blockHash common.Hash) (eth.BlockInfo, types.Receipts) {
@@ -85,4 +94,39 @@ func (p *PreimageOracle) ReceiptsByBlockHash(blockHash common.Hash) (eth.BlockIn
 	}
 
 	return info, receipts
+}
+
+func (p *PreimageOracle) GetBlob(ref eth.L1BlockRef, blobHash eth.IndexedBlobHash) *eth.Blob {
+	// Send a hint for the blob commitment & blob field elements.
+	blobReqMeta := make([]byte, 16)
+	binary.BigEndian.PutUint64(blobReqMeta[0:8], blobHash.Index)
+	binary.BigEndian.PutUint64(blobReqMeta[8:16], ref.Time)
+	p.hint.Hint(BlobHint(append(blobHash.Hash[:], blobReqMeta...)))
+
+	commitment := p.oracle.Get(preimage.Sha256Key(blobHash.Hash))
+
+	// Reconstruct the full blob from the 4096 field elements.
+	blob := eth.Blob{}
+	fieldElemKey := make([]byte, 80)
+	copy(fieldElemKey[:48], commitment)
+	for i := 0; i < params.BlobTxFieldElementsPerBlob; i++ {
+		binary.BigEndian.PutUint64(fieldElemKey[72:], uint64(i))
+		fieldElement := p.oracle.Get(preimage.BlobKey(crypto.Keccak256(fieldElemKey)))
+
+		copy(blob[i<<5:(i+1)<<5], fieldElement[:])
+	}
+
+	return &blob
+}
+
+func (p *PreimageOracle) Precompile(address common.Address, input []byte, requiredGas uint64) ([]byte, bool) {
+	hintBytes := append(address.Bytes(), binary.BigEndian.AppendUint64(nil, requiredGas)...)
+	hintBytes = append(hintBytes, input...)
+	p.hint.Hint(PrecompileHintV2(hintBytes))
+	key := preimage.PrecompileKey(crypto.Keccak256Hash(hintBytes))
+	result := p.oracle.Get(key)
+	if len(result) == 0 { // must contain at least the status code
+		panic(fmt.Errorf("unexpected precompile oracle behavior, got result: %x", result))
+	}
+	return result[1:], result[0] == 1
 }

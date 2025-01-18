@@ -5,27 +5,34 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"sync/atomic"
 	"time"
 
 	opservice "github.com/ethereum-optimism/optimism/op-service"
 	opcrypto "github.com/ethereum-optimism/optimism/op-service/crypto"
-	"github.com/ethereum-optimism/optimism/op-signer/client"
+	"github.com/ethereum-optimism/optimism/op-service/eth"
+	opsigner "github.com/ethereum-optimism/optimism/op-service/signer"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/ethereum/go-ethereum/log"
+	"github.com/ethereum/go-ethereum/params"
 	"github.com/urfave/cli/v2"
 )
 
 const (
 	// Duplicated L1 RPC flag
 	L1RPCFlagName = "l1-eth-rpc"
-	// Key Management Flags (also have op-signer client flags)
+	// Key Management Flags (also have signer client flags)
 	MnemonicFlagName   = "mnemonic"
 	HDPathFlagName     = "hd-path"
 	PrivateKeyFlagName = "private-key"
 	// TxMgr Flags (new + legacy + some shared flags)
 	NumConfirmationsFlagName          = "num-confirmations"
 	SafeAbortNonceTooLowCountFlagName = "safe-abort-nonce-too-low-count"
+	FeeLimitMultiplierFlagName        = "fee-limit-multiplier"
+	FeeLimitThresholdFlagName         = "txmgr.fee-limit-threshold"
+	MinBaseFeeFlagName                = "txmgr.min-basefee"
+	MinTipCapFlagName                 = "txmgr.min-tip-cap"
 	ResubmissionTimeoutFlagName       = "resubmission-timeout"
 	NetworkTimeoutFlagName            = "network-timeout"
 	TxSendTimeoutFlagName             = "txmgr.send-timeout"
@@ -48,7 +55,57 @@ var (
 	}
 )
 
+type DefaultFlagValues struct {
+	NumConfirmations          uint64
+	SafeAbortNonceTooLowCount uint64
+	FeeLimitMultiplier        uint64
+	FeeLimitThresholdGwei     float64
+	MinTipCapGwei             float64
+	MinBaseFeeGwei            float64
+	ResubmissionTimeout       time.Duration
+	NetworkTimeout            time.Duration
+	TxSendTimeout             time.Duration
+	TxNotInMempoolTimeout     time.Duration
+	ReceiptQueryInterval      time.Duration
+}
+
+var (
+	DefaultBatcherFlagValues = DefaultFlagValues{
+		NumConfirmations:          uint64(10),
+		SafeAbortNonceTooLowCount: uint64(3),
+		FeeLimitMultiplier:        uint64(5),
+		FeeLimitThresholdGwei:     100.0,
+		MinTipCapGwei:             1.0,
+		MinBaseFeeGwei:            1.0,
+		ResubmissionTimeout:       48 * time.Second,
+		NetworkTimeout:            10 * time.Second,
+		TxSendTimeout:             0, // Try sending txs indefinitely, to preserve tx ordering for Holocene
+		TxNotInMempoolTimeout:     2 * time.Minute,
+		ReceiptQueryInterval:      12 * time.Second,
+	}
+	DefaultChallengerFlagValues = DefaultFlagValues{
+		NumConfirmations:          uint64(3),
+		SafeAbortNonceTooLowCount: uint64(3),
+		FeeLimitMultiplier:        uint64(5),
+		FeeLimitThresholdGwei:     100.0,
+		MinTipCapGwei:             1.0,
+		MinBaseFeeGwei:            1.0,
+		ResubmissionTimeout:       24 * time.Second,
+		NetworkTimeout:            10 * time.Second,
+		TxSendTimeout:             2 * time.Minute,
+		TxNotInMempoolTimeout:     1 * time.Minute,
+		ReceiptQueryInterval:      12 * time.Second,
+	}
+
+	// geth enforces a 1 gwei minimum for blob tx fee
+	defaultMinBlobTxFee = big.NewInt(params.GWei)
+)
+
 func CLIFlags(envPrefix string) []cli.Flag {
+	return CLIFlagsWithDefaults(envPrefix, DefaultBatcherFlagValues)
+}
+
+func CLIFlagsWithDefaults(envPrefix string, defaults DefaultFlagValues) []cli.Flag {
 	prefixEnvVars := func(name string) []string {
 		return opservice.PrefixEnvVar(envPrefix, name)
 	}
@@ -71,46 +128,70 @@ func CLIFlags(envPrefix string) []cli.Flag {
 		&cli.Uint64Flag{
 			Name:    NumConfirmationsFlagName,
 			Usage:   "Number of confirmations which we will wait after sending a transaction",
-			Value:   10,
+			Value:   defaults.NumConfirmations,
 			EnvVars: prefixEnvVars("NUM_CONFIRMATIONS"),
 		},
 		&cli.Uint64Flag{
 			Name:    SafeAbortNonceTooLowCountFlagName,
 			Usage:   "Number of ErrNonceTooLow observations required to give up on a tx at a particular nonce without receiving confirmation",
-			Value:   3,
+			Value:   defaults.SafeAbortNonceTooLowCount,
 			EnvVars: prefixEnvVars("SAFE_ABORT_NONCE_TOO_LOW_COUNT"),
+		},
+		&cli.Uint64Flag{
+			Name:    FeeLimitMultiplierFlagName,
+			Usage:   "The multiplier applied to fee suggestions to put a hard limit on fee increases",
+			Value:   defaults.FeeLimitMultiplier,
+			EnvVars: prefixEnvVars("TXMGR_FEE_LIMIT_MULTIPLIER"),
+		},
+		&cli.Float64Flag{
+			Name:    FeeLimitThresholdFlagName,
+			Usage:   "The minimum threshold (in GWei) at which fee bumping starts to be capped. Allows arbitrary fee bumps below this threshold.",
+			Value:   defaults.FeeLimitThresholdGwei,
+			EnvVars: prefixEnvVars("TXMGR_FEE_LIMIT_THRESHOLD"),
+		},
+		&cli.Float64Flag{
+			Name:    MinTipCapFlagName,
+			Usage:   "Enforces a minimum tip cap (in GWei) to use when determining tx fees. 1 GWei by default.",
+			Value:   defaults.MinTipCapGwei,
+			EnvVars: prefixEnvVars("TXMGR_MIN_TIP_CAP"),
+		},
+		&cli.Float64Flag{
+			Name:    MinBaseFeeFlagName,
+			Usage:   "Enforces a minimum base fee (in GWei) to assume when determining tx fees. 1 GWei by default.",
+			Value:   defaults.MinBaseFeeGwei,
+			EnvVars: prefixEnvVars("TXMGR_MIN_BASEFEE"),
 		},
 		&cli.DurationFlag{
 			Name:    ResubmissionTimeoutFlagName,
 			Usage:   "Duration we will wait before resubmitting a transaction to L1",
-			Value:   48 * time.Second,
+			Value:   defaults.ResubmissionTimeout,
 			EnvVars: prefixEnvVars("RESUBMISSION_TIMEOUT"),
 		},
 		&cli.DurationFlag{
 			Name:    NetworkTimeoutFlagName,
 			Usage:   "Timeout for all network operations",
-			Value:   2 * time.Second,
+			Value:   defaults.NetworkTimeout,
 			EnvVars: prefixEnvVars("NETWORK_TIMEOUT"),
 		},
 		&cli.DurationFlag{
 			Name:    TxSendTimeoutFlagName,
 			Usage:   "Timeout for sending transactions. If 0 it is disabled.",
-			Value:   0,
+			Value:   defaults.TxSendTimeout,
 			EnvVars: prefixEnvVars("TXMGR_TX_SEND_TIMEOUT"),
 		},
 		&cli.DurationFlag{
 			Name:    TxNotInMempoolTimeoutFlagName,
 			Usage:   "Timeout for aborting a tx send if the tx does not make it to the mempool.",
-			Value:   2 * time.Minute,
+			Value:   defaults.TxNotInMempoolTimeout,
 			EnvVars: prefixEnvVars("TXMGR_TX_NOT_IN_MEMPOOL_TIMEOUT"),
 		},
 		&cli.DurationFlag{
 			Name:    ReceiptQueryIntervalFlagName,
 			Usage:   "Frequency to poll for receipts",
-			Value:   12 * time.Second,
+			Value:   defaults.ReceiptQueryInterval,
 			EnvVars: prefixEnvVars("TXMGR_RECEIPT_QUERY_INTERVAL"),
 		},
-	}, client.CLIFlags(envPrefix)...)
+	}, opsigner.CLIFlags(envPrefix, "")...)
 }
 
 type CLIConfig struct {
@@ -120,14 +201,36 @@ type CLIConfig struct {
 	SequencerHDPath           string
 	L2OutputHDPath            string
 	PrivateKey                string
-	SignerCLIConfig           client.CLIConfig
+	SignerCLIConfig           opsigner.CLIConfig
 	NumConfirmations          uint64
 	SafeAbortNonceTooLowCount uint64
+	FeeLimitMultiplier        uint64
+	FeeLimitThresholdGwei     float64
+	MinBaseFeeGwei            float64
+	MinTipCapGwei             float64
 	ResubmissionTimeout       time.Duration
 	ReceiptQueryInterval      time.Duration
 	NetworkTimeout            time.Duration
 	TxSendTimeout             time.Duration
 	TxNotInMempoolTimeout     time.Duration
+}
+
+func NewCLIConfig(l1RPCURL string, defaults DefaultFlagValues) CLIConfig {
+	return CLIConfig{
+		L1RPCURL:                  l1RPCURL,
+		NumConfirmations:          defaults.NumConfirmations,
+		SafeAbortNonceTooLowCount: defaults.SafeAbortNonceTooLowCount,
+		FeeLimitMultiplier:        defaults.FeeLimitMultiplier,
+		FeeLimitThresholdGwei:     defaults.FeeLimitThresholdGwei,
+		MinTipCapGwei:             defaults.MinTipCapGwei,
+		MinBaseFeeGwei:            defaults.MinBaseFeeGwei,
+		ResubmissionTimeout:       defaults.ResubmissionTimeout,
+		NetworkTimeout:            defaults.NetworkTimeout,
+		TxSendTimeout:             defaults.TxSendTimeout,
+		TxNotInMempoolTimeout:     defaults.TxNotInMempoolTimeout,
+		ReceiptQueryInterval:      defaults.ReceiptQueryInterval,
+		SignerCLIConfig:           opsigner.NewCLIConfig(),
+	}
 }
 
 func (m CLIConfig) Check() error {
@@ -139,6 +242,13 @@ func (m CLIConfig) Check() error {
 	}
 	if m.NetworkTimeout == 0 {
 		return errors.New("must provide NetworkTimeout")
+	}
+	if m.FeeLimitMultiplier == 0 {
+		return errors.New("must provide FeeLimitMultiplier")
+	}
+	if m.MinBaseFeeGwei < m.MinTipCapGwei {
+		return fmt.Errorf("minBaseFee smaller than minTipCap, have %f < %f",
+			m.MinBaseFeeGwei, m.MinTipCapGwei)
 	}
 	if m.ResubmissionTimeout == 0 {
 		return errors.New("must provide ResubmissionTimeout")
@@ -166,9 +276,13 @@ func ReadCLIConfig(ctx *cli.Context) CLIConfig {
 		SequencerHDPath:           ctx.String(SequencerHDPathFlag.Name),
 		L2OutputHDPath:            ctx.String(L2OutputHDPathFlag.Name),
 		PrivateKey:                ctx.String(PrivateKeyFlagName),
-		SignerCLIConfig:           client.ReadCLIConfig(ctx),
+		SignerCLIConfig:           opsigner.ReadCLIConfig(ctx),
 		NumConfirmations:          ctx.Uint64(NumConfirmationsFlagName),
 		SafeAbortNonceTooLowCount: ctx.Uint64(SafeAbortNonceTooLowCountFlagName),
+		FeeLimitMultiplier:        ctx.Uint64(FeeLimitMultiplierFlagName),
+		FeeLimitThresholdGwei:     ctx.Float64(FeeLimitThresholdFlagName),
+		MinBaseFeeGwei:            ctx.Float64(MinBaseFeeFlagName),
+		MinTipCapGwei:             ctx.Float64(MinTipCapFlagName),
 		ResubmissionTimeout:       ctx.Duration(ResubmissionTimeoutFlagName),
 		ReceiptQueryInterval:      ctx.Duration(ReceiptQueryIntervalFlagName),
 		NetworkTimeout:            ctx.Duration(NetworkTimeoutFlagName),
@@ -177,23 +291,23 @@ func ReadCLIConfig(ctx *cli.Context) CLIConfig {
 	}
 }
 
-func NewConfig(cfg CLIConfig, l log.Logger) (Config, error) {
+func NewConfig(cfg CLIConfig, l log.Logger) (*Config, error) {
 	if err := cfg.Check(); err != nil {
-		return Config{}, fmt.Errorf("invalid config: %w", err)
+		return nil, fmt.Errorf("invalid config: %w", err)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.NetworkTimeout)
 	defer cancel()
 	l1, err := ethclient.DialContext(ctx, cfg.L1RPCURL)
 	if err != nil {
-		return Config{}, fmt.Errorf("could not dial eth client: %w", err)
+		return nil, fmt.Errorf("could not dial eth client: %w", err)
 	}
 
 	ctx, cancel = context.WithTimeout(context.Background(), cfg.NetworkTimeout)
 	defer cancel()
 	chainID, err := l1.ChainID(ctx)
 	if err != nil {
-		return Config{}, fmt.Errorf("could not dial fetch L1 chain ID: %w", err)
+		return nil, fmt.Errorf("could not dial fetch L1 chain ID: %w", err)
 	}
 
 	// Allow backwards compatible ways of specifying the HD path
@@ -206,12 +320,26 @@ func NewConfig(cfg CLIConfig, l log.Logger) (Config, error) {
 
 	signerFactory, from, err := opcrypto.SignerFactoryFromConfig(l, cfg.PrivateKey, cfg.Mnemonic, hdPath, cfg.SignerCLIConfig)
 	if err != nil {
-		return Config{}, fmt.Errorf("could not init signer: %w", err)
+		return nil, fmt.Errorf("could not init signer: %w", err)
 	}
 
-	return Config{
+	feeLimitThreshold, err := eth.GweiToWei(cfg.FeeLimitThresholdGwei)
+	if err != nil {
+		return nil, fmt.Errorf("invalid fee limit threshold: %w", err)
+	}
+
+	minBaseFee, err := eth.GweiToWei(cfg.MinBaseFeeGwei)
+	if err != nil {
+		return nil, fmt.Errorf("invalid min base fee: %w", err)
+	}
+
+	minTipCap, err := eth.GweiToWei(cfg.MinTipCapGwei)
+	if err != nil {
+		return nil, fmt.Errorf("invalid min tip cap: %w", err)
+	}
+
+	res := Config{
 		Backend:                   l1,
-		ResubmissionTimeout:       cfg.ResubmissionTimeout,
 		ChainID:                   chainID,
 		TxSendTimeout:             cfg.TxSendTimeout,
 		TxNotInMempoolTimeout:     cfg.TxNotInMempoolTimeout,
@@ -221,7 +349,16 @@ func NewConfig(cfg CLIConfig, l log.Logger) (Config, error) {
 		SafeAbortNonceTooLowCount: cfg.SafeAbortNonceTooLowCount,
 		Signer:                    signerFactory(chainID),
 		From:                      from,
-	}, nil
+	}
+
+	res.ResubmissionTimeout.Store(int64(cfg.ResubmissionTimeout))
+	res.FeeLimitThreshold.Store(feeLimitThreshold)
+	res.FeeLimitMultiplier.Store(cfg.FeeLimitMultiplier)
+	res.MinBaseFee.Store(minBaseFee)
+	res.MinTipCap.Store(minTipCap)
+	res.MinBlobTxFee.Store(defaultMinBlobTxFee)
+
+	return &res, nil
 }
 
 // Config houses parameters for altering the behavior of a SimpleTxManager.
@@ -231,7 +368,23 @@ type Config struct {
 	// published transaction has been mined, the new tx with a bumped gas
 	// price will be published. Only one publication at MaxGasPrice will be
 	// attempted.
-	ResubmissionTimeout time.Duration
+	ResubmissionTimeout atomic.Int64
+
+	// The multiplier applied to fee suggestions to put a hard limit on fee increases.
+	FeeLimitMultiplier atomic.Uint64
+
+	// Minimum threshold (in Wei) at which the FeeLimitMultiplier takes effect.
+	// On low-fee networks, like test networks, this allows for arbitrary fee bumps
+	// below this threshold.
+	FeeLimitThreshold atomic.Pointer[big.Int]
+
+	// Minimum base fee (in Wei) to assume when determining tx fees.
+	MinBaseFee atomic.Pointer[big.Int]
+
+	// Minimum tip cap (in Wei) to enforce when determining tx fees.
+	MinTipCap atomic.Pointer[big.Int]
+
+	MinBlobTxFee atomic.Pointer[big.Int]
 
 	// ChainID is the chain ID of the L1 chain.
 	ChainID *big.Int
@@ -248,7 +401,7 @@ type Config struct {
 	// This is intended to be used for network requests that can be replayed.
 	NetworkTimeout time.Duration
 
-	// RequireQueryInterval is the interval at which the tx manager will
+	// ReceiptQueryInterval is the interval at which the tx manager will
 	// query the backend to check for confirmations after a tx at a
 	// specific gas price has been published.
 	ReceiptQueryInterval time.Duration
@@ -265,4 +418,48 @@ type Config struct {
 	// Signer is used to sign transactions when the gas price is increased.
 	Signer opcrypto.SignerFn
 	From   common.Address
+
+	// GasPriceEstimatorFn is used to estimate the gas price for a transaction.
+	// If nil, DefaultGasPriceEstimatorFn is used.
+	GasPriceEstimatorFn GasPriceEstimatorFn
+}
+
+func (m *Config) Check() error {
+	if m.Backend == nil {
+		return errors.New("must provide the Backend")
+	}
+	if m.NumConfirmations == 0 {
+		return errors.New("NumConfirmations must not be 0")
+	}
+	if m.NetworkTimeout == 0 {
+		return errors.New("must provide NetworkTimeout")
+	}
+	if m.FeeLimitMultiplier.Load() == 0 {
+		return errors.New("must provide FeeLimitMultiplier")
+	}
+	minBaseFee := m.MinBaseFee.Load()
+	minTipCap := m.MinTipCap.Load()
+	if minBaseFee != nil && minTipCap != nil && minBaseFee.Cmp(minTipCap) == -1 {
+		return fmt.Errorf("minBaseFee smaller than minTipCap, have %v < %v",
+			minBaseFee, minTipCap)
+	}
+	if m.ResubmissionTimeout.Load() == 0 {
+		return errors.New("must provide ResubmissionTimeout")
+	}
+	if m.ReceiptQueryInterval == 0 {
+		return errors.New("must provide ReceiptQueryInterval")
+	}
+	if m.TxNotInMempoolTimeout == 0 {
+		return errors.New("must provide TxNotInMempoolTimeout")
+	}
+	if m.SafeAbortNonceTooLowCount == 0 {
+		return errors.New("SafeAbortNonceTooLowCount must not be 0")
+	}
+	if m.Signer == nil {
+		return errors.New("must provide the Signer")
+	}
+	if m.ChainID == nil {
+		return errors.New("must provide the ChainID")
+	}
+	return nil
 }

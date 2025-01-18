@@ -8,7 +8,7 @@ import (
 	"io"
 	"math/big"
 
-	"github.com/ethereum-optimism/optimism/op-node/eth"
+	"github.com/ethereum-optimism/optimism/op-service/eth"
 	"github.com/ethereum/go-ethereum/common"
 )
 
@@ -69,7 +69,7 @@ func ReadUint64(r io.Reader) (uint64, error) {
 		return n, fmt.Errorf("number padding was not empty: %x", readPadding[:])
 	}
 	if err := binary.Read(r, binary.BigEndian, &n); err != nil {
-		return 0, fmt.Errorf("expected number length to be 8 bytes")
+		return 0, errors.New("expected number length to be 8 bytes")
 	}
 	return n, nil
 }

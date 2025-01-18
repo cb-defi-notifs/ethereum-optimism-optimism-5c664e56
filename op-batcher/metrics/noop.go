@@ -1,16 +1,24 @@
 package metrics
 
 import (
-	"github.com/ethereum-optimism/optimism/op-node/eth"
+	"io"
+	"math"
+
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/ethclient"
+	"github.com/ethereum/go-ethereum/log"
+
 	"github.com/ethereum-optimism/optimism/op-node/rollup/derive"
+	"github.com/ethereum-optimism/optimism/op-service/eth"
 	opmetrics "github.com/ethereum-optimism/optimism/op-service/metrics"
 	txmetrics "github.com/ethereum-optimism/optimism/op-service/txmgr/metrics"
-	"github.com/ethereum/go-ethereum/core/types"
 )
 
 type noopMetrics struct {
 	opmetrics.NoopRefMetrics
 	txmetrics.NoopTxMetrics
+	opmetrics.NoopRPCMetrics
 }
 
 var NoopMetrics Metricer = new(noopMetrics)
@@ -35,3 +43,20 @@ func (*noopMetrics) RecordChannelTimedOut(derive.ChannelID)       {}
 func (*noopMetrics) RecordBatchTxSubmitted() {}
 func (*noopMetrics) RecordBatchTxSuccess()   {}
 func (*noopMetrics) RecordBatchTxFailed()    {}
+func (*noopMetrics) RecordBlobUsedBytes(int) {}
+func (*noopMetrics) StartBalanceMetrics(log.Logger, *ethclient.Client, common.Address) io.Closer {
+	return nil
+}
+func (nm *noopMetrics) PendingDABytes() float64 {
+	return 0.0
+}
+
+// ThrottlingMetrics is a noopMetrics that always returns a max value for PendingDABytes, to use in testing batcher
+// backlog throttling.
+type ThrottlingMetrics struct {
+	noopMetrics
+}
+
+func (nm *ThrottlingMetrics) PendingDABytes() float64 {
+	return math.MaxFloat64
+}

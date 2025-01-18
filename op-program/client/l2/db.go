@@ -13,19 +13,19 @@ import (
 
 var codePrefixedKeyLength = common.HashLength + len(rawdb.CodePrefix)
 
-var (
-	ErrInvalidKeyLength = errors.New("pre-images must be identified by 32-byte hash keys")
-)
+var ErrInvalidKeyLength = errors.New("pre-images must be identified by 32-byte hash keys")
 
 type OracleKeyValueStore struct {
-	db     ethdb.KeyValueStore
-	oracle StateOracle
+	db      ethdb.KeyValueStore
+	oracle  StateOracle
+	chainID uint64
 }
 
-func NewOracleBackedDB(oracle StateOracle) *OracleKeyValueStore {
+func NewOracleBackedDB(oracle StateOracle, chainID uint64) *OracleKeyValueStore {
 	return &OracleKeyValueStore{
-		db:     memorydb.New(),
-		oracle: oracle,
+		db:      memorydb.New(),
+		oracle:  oracle,
+		chainID: chainID,
 	}
 }
 
@@ -40,12 +40,12 @@ func (o *OracleKeyValueStore) Get(key []byte) ([]byte, error) {
 
 	if len(key) == codePrefixedKeyLength && bytes.HasPrefix(key, rawdb.CodePrefix) {
 		key = key[len(rawdb.CodePrefix):]
-		return o.oracle.CodeByHash(*(*[common.HashLength]byte)(key)), nil
+		return o.oracle.CodeByHash(*(*[common.HashLength]byte)(key), o.chainID), nil
 	}
 	if len(key) != common.HashLength {
 		return nil, ErrInvalidKeyLength
 	}
-	return o.oracle.NodeByHash(*(*[common.HashLength]byte)(key)), nil
+	return o.oracle.NodeByHash(*(*[common.HashLength]byte)(key), o.chainID), nil
 }
 
 func (o *OracleKeyValueStore) NewBatch() ethdb.Batch {
@@ -74,7 +74,11 @@ func (o *OracleKeyValueStore) Delete(key []byte) error {
 	panic("not supported")
 }
 
-func (o *OracleKeyValueStore) Stat(property string) (string, error) {
+func (o *OracleKeyValueStore) DeleteRange(start, end []byte) error {
+	panic("not supported")
+}
+
+func (o *OracleKeyValueStore) Stat() (string, error) {
 	panic("not supported")
 }
 
@@ -83,9 +87,5 @@ func (o *OracleKeyValueStore) NewIterator(prefix []byte, start []byte) ethdb.Ite
 }
 
 func (o *OracleKeyValueStore) Compact(start []byte, limit []byte) error {
-	panic("not supported")
-}
-
-func (o *OracleKeyValueStore) NewSnapshot() (ethdb.Snapshot, error) {
 	panic("not supported")
 }

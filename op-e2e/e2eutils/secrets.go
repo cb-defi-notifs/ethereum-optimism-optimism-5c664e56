@@ -3,25 +3,29 @@ package e2eutils
 import (
 	"crypto/ecdsa"
 	"fmt"
+	"strconv"
 
 	hdwallet "github.com/ethereum-optimism/go-ethereum-hdwallet"
 	"github.com/ethereum/go-ethereum/accounts"
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/crypto"
 )
+
+const defaultHDPathPrefix = "m/44'/60'/0'/0/"
 
 // DefaultMnemonicConfig is the default mnemonic used in testing.
 // We prefer a mnemonic rather than direct private keys to make it easier
 // to export all testing keys in external tooling for use during debugging.
+// If these values are changed, it is subject to breaking tests. They
+// must be in sync with the values in the DeployConfig used to create the system.
 var DefaultMnemonicConfig = &MnemonicConfig{
-	Mnemonic:     "test test test test test test test test test test test junk",
-	Deployer:     "m/44'/60'/0'/0/1",
-	CliqueSigner: "m/44'/60'/0'/0/2",
-	Proposer:     "m/44'/60'/0'/0/3",
-	Batcher:      "m/44'/60'/0'/0/4",
+	Mnemonic: "test test test test test test test test test test test junk",
+	// Note: "m/44'/60'/0'/0/0" is a legacy mnemonic path, used for the L1 clique signer.
+	Proposer:     "m/44'/60'/0'/0/1",
+	Batcher:      "m/44'/60'/0'/0/2",
+	Deployer:     "m/44'/60'/0'/0/3",
+	Alice:        "m/44'/60'/0'/0/4",
 	SequencerP2P: "m/44'/60'/0'/0/5",
-	Alice:        "m/44'/60'/0'/0/6",
 	Bob:          "m/44'/60'/0'/0/7",
 	Mallory:      "m/44'/60'/0'/0/8",
 	SysCfgOwner:  "m/44'/60'/0'/0/9",
@@ -32,9 +36,8 @@ var DefaultMnemonicConfig = &MnemonicConfig{
 type MnemonicConfig struct {
 	Mnemonic string
 
-	Deployer     string
-	CliqueSigner string
-	SysCfgOwner  string
+	Deployer    string
+	SysCfgOwner string
 
 	// rollup actors
 	Proposer     string
@@ -59,10 +62,6 @@ func (m *MnemonicConfig) Secrets() (*Secrets, error) {
 	}
 
 	deployer, err := wallet.PrivateKey(account(m.Deployer))
-	if err != nil {
-		return nil, err
-	}
-	cliqueSigner, err := wallet.PrivateKey(account(m.CliqueSigner))
 	if err != nil {
 		return nil, err
 	}
@@ -97,7 +96,6 @@ func (m *MnemonicConfig) Secrets() (*Secrets, error) {
 
 	return &Secrets{
 		Deployer:     deployer,
-		CliqueSigner: cliqueSigner,
 		SysCfgOwner:  sysCfgOwner,
 		Proposer:     proposer,
 		Batcher:      batcher,
@@ -111,9 +109,8 @@ func (m *MnemonicConfig) Secrets() (*Secrets, error) {
 
 // Secrets bundles secp256k1 private keys for all common rollup actors for testing purposes.
 type Secrets struct {
-	Deployer     *ecdsa.PrivateKey
-	CliqueSigner *ecdsa.PrivateKey
-	SysCfgOwner  *ecdsa.PrivateKey
+	Deployer    *ecdsa.PrivateKey
+	SysCfgOwner *ecdsa.PrivateKey
 
 	// rollup actors
 	Proposer     *ecdsa.PrivateKey
@@ -129,20 +126,11 @@ type Secrets struct {
 	Wallet *hdwallet.Wallet
 }
 
-// EncodePrivKey encodes the given private key in 32 bytes
-func EncodePrivKey(priv *ecdsa.PrivateKey) hexutil.Bytes {
-	privkey := make([]byte, 32)
-	blob := priv.D.Bytes()
-	copy(privkey[32-len(blob):], blob)
-	return privkey
-}
-
 // Addresses computes the ethereum address of each account,
 // which can then be kept around for fast precomputed address access.
 func (s *Secrets) Addresses() *Addresses {
 	return &Addresses{
 		Deployer:     crypto.PubkeyToAddress(s.Deployer.PublicKey),
-		CliqueSigner: crypto.PubkeyToAddress(s.CliqueSigner.PublicKey),
 		SysCfgOwner:  crypto.PubkeyToAddress(s.SysCfgOwner.PublicKey),
 		Proposer:     crypto.PubkeyToAddress(s.Proposer.PublicKey),
 		Batcher:      crypto.PubkeyToAddress(s.Batcher.PublicKey),
@@ -155,9 +143,8 @@ func (s *Secrets) Addresses() *Addresses {
 
 // Addresses bundles the addresses for all common rollup addresses for testing purposes.
 type Addresses struct {
-	Deployer     common.Address
-	CliqueSigner common.Address
-	SysCfgOwner  common.Address
+	Deployer    common.Address
+	SysCfgOwner common.Address
 
 	// rollup actors
 	Proposer     common.Address
@@ -173,7 +160,6 @@ type Addresses struct {
 func (a *Addresses) All() []common.Address {
 	return []common.Address{
 		a.Deployer,
-		a.CliqueSigner,
 		a.SysCfgOwner,
 		a.Proposer,
 		a.Batcher,
@@ -182,4 +168,15 @@ func (a *Addresses) All() []common.Address {
 		a.Bob,
 		a.Mallory,
 	}
+}
+
+func (s *Secrets) AccountAtIdx(idx int) *ecdsa.PrivateKey {
+	account := accounts.Account{URL: accounts.URL{
+		Path: defaultHDPathPrefix + strconv.Itoa(idx),
+	}}
+	pk, err := s.Wallet.PrivateKey(account)
+	if err != nil {
+		panic(err)
+	}
+	return pk
 }

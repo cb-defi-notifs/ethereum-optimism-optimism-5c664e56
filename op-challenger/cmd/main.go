@@ -1,14 +1,21 @@
 package main
 
 import (
+	"context"
 	"os"
 
-	"github.com/ethereum/go-ethereum/log"
+	"github.com/ethereum-optimism/optimism/op-challenger/metrics"
 	"github.com/urfave/cli/v2"
 
+	"github.com/ethereum/go-ethereum/log"
+
+	challenger "github.com/ethereum-optimism/optimism/op-challenger"
 	"github.com/ethereum-optimism/optimism/op-challenger/config"
 	"github.com/ethereum-optimism/optimism/op-challenger/flags"
 	"github.com/ethereum-optimism/optimism/op-challenger/version"
+	opservice "github.com/ethereum-optimism/optimism/op-service"
+	"github.com/ethereum-optimism/optimism/op-service/cliapp"
+	"github.com/ethereum-optimism/optimism/op-service/ctxinterrupt"
 	oplog "github.com/ethereum-optimism/optimism/op-service/log"
 )
 
@@ -18,48 +25,58 @@ var (
 )
 
 // VersionWithMeta holds the textual version string including the metadata.
-var VersionWithMeta = func() string {
-	v := version.Version
-	if GitCommit != "" {
-		v += "-" + GitCommit[:8]
-	}
-	if GitDate != "" {
-		v += "-" + GitDate
-	}
-	if version.Meta != "" {
-		v += "-" + version.Meta
-	}
-	return v
-}()
+var VersionWithMeta = opservice.FormatVersion(version.Version, GitCommit, GitDate, version.Meta)
 
 func main() {
+	args := os.Args
+	ctx := ctxinterrupt.WithSignalWaiterMain(context.Background())
+	if err := run(ctx, args, func(ctx context.Context, l log.Logger, config *config.Config) (cliapp.Lifecycle, error) {
+		return challenger.Main(ctx, l, config, metrics.NewMetrics())
+	}); err != nil {
+		log.Crit("Application failed", "err", err)
+	}
+}
+
+type ConfiguredLifecycle func(ctx context.Context, log log.Logger, config *config.Config) (cliapp.Lifecycle, error)
+
+func run(ctx context.Context, args []string, action ConfiguredLifecycle) error {
 	oplog.SetupDefaults()
 
 	app := cli.NewApp()
 	app.Version = VersionWithMeta
-	app.Flags = flags.Flags
+	app.Flags = cliapp.ProtectFlags(flags.Flags)
 	app.Name = "op-challenger"
 	app.Usage = "Challenge outputs"
 	app.Description = "Ensures that on chain outputs are correct."
-	app.Action = func(ctx *cli.Context) error {
-		return FaultGame(VersionWithMeta, ctx)
+	app.Commands = []*cli.Command{
+		ListGamesCommand,
+		ListClaimsCommand,
+		ListCreditsCommand,
+		CreateGameCommand,
+		MoveCommand,
+		ResolveCommand,
+		ResolveClaimCommand,
+		RunTraceCommand,
 	}
-	if err := app.Run(os.Args); err != nil {
-		log.Crit("Application failed", "message", err)
-	}
+	app.Action = cliapp.LifecycleCmd(func(ctx *cli.Context, close context.CancelCauseFunc) (cliapp.Lifecycle, error) {
+		logger, err := setupLogging(ctx)
+		if err != nil {
+			return nil, err
+		}
+		logger.Info("Starting op-challenger", "version", VersionWithMeta)
+
+		cfg, err := flags.NewConfigFromCLI(ctx, logger)
+		if err != nil {
+			return nil, err
+		}
+		return action(ctx.Context, logger, cfg)
+	})
+	return app.RunContext(ctx, args)
 }
 
-type ConfigAction func(log log.Logger, version string, config *config.Config) error
-
-func FaultGame(version string, cliCtx *cli.Context) error {
-	cfg, err := config.NewConfigFromCLI(cliCtx)
-	if err != nil {
-		return err
-	}
-	if err := cfg.Check(); err != nil {
-		return err
-	}
-	log := oplog.NewLogger(cfg.LogConfig)
-	log.Info("Fault game started")
-	return nil
+func setupLogging(ctx *cli.Context) (log.Logger, error) {
+	logCfg := oplog.ReadCLIConfig(ctx)
+	logger := oplog.NewLogger(oplog.AppOut(ctx), logCfg)
+	oplog.SetGlobalLogHandler(logger.Handler())
+	return logger, nil
 }

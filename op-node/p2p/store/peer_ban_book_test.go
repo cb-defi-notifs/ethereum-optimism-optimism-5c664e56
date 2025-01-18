@@ -5,8 +5,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ethereum-optimism/optimism/op-node/testlog"
 	"github.com/ethereum-optimism/optimism/op-service/clock"
+	"github.com/ethereum-optimism/optimism/op-service/testlog"
 	"github.com/ethereum/go-ethereum/log"
 	ds "github.com/ipfs/go-datastore"
 	"github.com/ipfs/go-datastore/sync"
@@ -17,7 +17,7 @@ func TestGetUnknownPeerBan(t *testing.T) {
 	book := createMemoryPeerBanBook(t)
 	defer book.Close()
 	exp, err := book.GetPeerBanExpiration("a")
-	require.Same(t, UnknownBanErr, err)
+	require.Same(t, ErrUnknownBan, err)
 	require.Equal(t, time.Time{}, exp)
 }
 
@@ -33,7 +33,7 @@ func TestRoundTripPeerBan(t *testing.T) {
 
 func createMemoryPeerBanBook(t *testing.T) *peerBanBook {
 	store := sync.MutexWrap(ds.NewMapDatastore())
-	logger := testlog.Logger(t, log.LvlInfo)
+	logger := testlog.Logger(t, log.LevelInfo)
 	c := clock.NewDeterministicClock(time.UnixMilli(100))
 	book, err := newPeerBanBook(context.Background(), logger, c, store)
 	require.NoError(t, err)

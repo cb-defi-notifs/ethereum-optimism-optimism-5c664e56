@@ -14,7 +14,7 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 
-	"github.com/ethereum-optimism/optimism/op-node/eth"
+	"github.com/ethereum-optimism/optimism/op-service/eth"
 )
 
 func randConfig() *Config {
@@ -42,7 +42,7 @@ func randConfig() *Config {
 		BlockTime:              2,
 		MaxSequencerDrift:      100,
 		SeqWindowSize:          2,
-		ChannelTimeout:         123,
+		ChannelTimeoutBedrock:  123,
 		L1ChainID:              big.NewInt(900),
 		L2ChainID:              big.NewInt(901),
 		BatchInboxAddress:      randAddr(),
@@ -147,9 +147,9 @@ func TestRandomConfigDescription(t *testing.T) {
 	})
 	t.Run("named L1", func(t *testing.T) {
 		config := randConfig()
-		config.L1ChainID = big.NewInt(5)
+		config.L1ChainID = big.NewInt(11155111)
 		out := config.Description(map[string]string{config.L2ChainID.String(): "foobar chain"})
-		require.Contains(t, out, "goerli")
+		require.Contains(t, out, "sepolia")
 	})
 	t.Run("unnamed", func(t *testing.T) {
 		config := randConfig()
@@ -169,7 +169,38 @@ func TestRandomConfigDescription(t *testing.T) {
 		out := config.Description(nil)
 		require.Contains(t, out, "Regolith: @ genesis")
 	})
-	t.Run("regolith date", func(t *testing.T) {
+	t.Run("optimism forks check,  date", func(t *testing.T) {
+		config := randConfig()
+		r := uint64(1677119335)
+		config.RegolithTime = &r
+		c := uint64(1677119336)
+		config.CanyonTime = &c
+		d := uint64(1677119337)
+		config.DeltaTime = &d
+		e := uint64(1677119338)
+		config.EcotoneTime = &e
+		f := uint64(1677119339)
+		config.FjordTime = &f
+		h := uint64(1677119340)
+		config.HoloceneTime = &h
+		i := uint64(1677119341)
+		config.IsthmusTime = &i
+		it := uint64(1677119342)
+		config.InteropTime = &it
+
+		out := config.Description(nil)
+		// Don't check human-readable part of the date, it's timezone-dependent.
+		// Don't make this test fail only in Australia :')
+		require.Contains(t, out, fmt.Sprintf("Regolith: @ %d ~ ", r))
+		require.Contains(t, out, fmt.Sprintf("Canyon: @ %d ~ ", c))
+		require.Contains(t, out, fmt.Sprintf("Delta: @ %d ~ ", d))
+		require.Contains(t, out, fmt.Sprintf("Ecotone: @ %d ~ ", e))
+		require.Contains(t, out, fmt.Sprintf("Fjord: @ %d ~ ", f))
+		require.Contains(t, out, fmt.Sprintf("Holocene: @ %d ~ ", h))
+		require.Contains(t, out, fmt.Sprintf("Isthmus: @ %d ~ ", i))
+		require.Contains(t, out, fmt.Sprintf("Interop: @ %d ~ ", it))
+	})
+	t.Run("holocene & isthmus date", func(t *testing.T) {
 		config := randConfig()
 		x := uint64(1677119335)
 		config.RegolithTime = &x
@@ -180,21 +211,114 @@ func TestRandomConfigDescription(t *testing.T) {
 	})
 }
 
-// TestRegolithActivation tests the activation condition of the Regolith upgrade.
-func TestRegolithActivation(t *testing.T) {
-	config := randConfig()
-	config.RegolithTime = nil
-	require.False(t, config.IsRegolith(0), "false if nil time, even if checking 0")
-	require.False(t, config.IsRegolith(123456), "false if nil time")
-	config.RegolithTime = new(uint64)
-	require.True(t, config.IsRegolith(0), "true at zero")
-	require.True(t, config.IsRegolith(123456), "true for any")
-	x := uint64(123)
-	config.RegolithTime = &x
-	require.False(t, config.IsRegolith(0))
-	require.False(t, config.IsRegolith(122))
-	require.True(t, config.IsRegolith(123))
-	require.True(t, config.IsRegolith(124))
+// TestActivations tests the activation condition of the various upgrades.
+func TestActivations(t *testing.T) {
+	for _, test := range []struct {
+		name           string
+		setUpgradeTime func(t *uint64, c *Config)
+		checkEnabled   func(t uint64, c *Config) bool
+	}{
+		{
+			name: "Regolith",
+			setUpgradeTime: func(t *uint64, c *Config) {
+				c.RegolithTime = t
+			},
+			checkEnabled: func(t uint64, c *Config) bool {
+				return c.IsRegolith(t)
+			},
+		},
+		{
+			name: "Canyon",
+			setUpgradeTime: func(t *uint64, c *Config) {
+				c.CanyonTime = t
+			},
+			checkEnabled: func(t uint64, c *Config) bool {
+				return c.IsCanyon(t)
+			},
+		},
+		{
+			name: "Delta",
+			setUpgradeTime: func(t *uint64, c *Config) {
+				c.DeltaTime = t
+			},
+			checkEnabled: func(t uint64, c *Config) bool {
+				return c.IsDelta(t)
+			},
+		},
+		{
+			name: "Ecotone",
+			setUpgradeTime: func(t *uint64, c *Config) {
+				c.EcotoneTime = t
+			},
+			checkEnabled: func(t uint64, c *Config) bool {
+				return c.IsEcotone(t)
+			},
+		},
+		{
+			name: "Fjord",
+			setUpgradeTime: func(t *uint64, c *Config) {
+				c.FjordTime = t
+			},
+			checkEnabled: func(t uint64, c *Config) bool {
+				return c.IsFjord(t)
+			},
+		},
+		{
+			name: "Granite",
+			setUpgradeTime: func(t *uint64, c *Config) {
+				c.GraniteTime = t
+			},
+			checkEnabled: func(t uint64, c *Config) bool {
+				return c.IsGranite(t)
+			},
+		},
+		{
+			name: "Holocene",
+			setUpgradeTime: func(t *uint64, c *Config) {
+				c.HoloceneTime = t
+			},
+			checkEnabled: func(t uint64, c *Config) bool {
+				return c.IsHolocene(t)
+			},
+		},
+		{
+			name: "Isthmus",
+			setUpgradeTime: func(t *uint64, c *Config) {
+				c.IsthmusTime = t
+			},
+			checkEnabled: func(t uint64, c *Config) bool {
+				return c.IsIsthmus(t)
+			},
+		},
+		{
+			name: "Interop",
+			setUpgradeTime: func(t *uint64, c *Config) {
+				c.InteropTime = t
+			},
+			checkEnabled: func(t uint64, c *Config) bool {
+				return c.IsInterop(t)
+			},
+		},
+	} {
+		tt := test
+		t.Run(fmt.Sprintf("TestActivations_%s", tt.name), func(t *testing.T) {
+			config := randConfig()
+			test.setUpgradeTime(nil, config)
+			require.False(t, tt.checkEnabled(0, config), "false if nil time, even if checking 0")
+			require.False(t, tt.checkEnabled(123456, config), "false if nil time")
+
+			test.setUpgradeTime(new(uint64), config)
+			require.True(t, tt.checkEnabled(0, config), "true at zero")
+			require.True(t, tt.checkEnabled(123456, config), "true for any")
+
+			x := uint64(123)
+			test.setUpgradeTime(&x, config)
+			require.False(t, tt.checkEnabled(0, config))
+			require.False(t, tt.checkEnabled(122, config))
+			require.True(t, tt.checkEnabled(123, config))
+			require.True(t, tt.checkEnabled(124, config))
+		})
+	}
 }
 
 type mockL2Client struct {
@@ -219,7 +343,7 @@ func TestValidateL2Config(t *testing.T) {
 	config.Genesis.L2.Number = 100
 	config.Genesis.L2.Hash = [32]byte{0x01}
 	mockClient := mockL2Client{chainID: big.NewInt(100), Hash: common.Hash{0x01}}
-	err := config.ValidateL2Config(context.TODO(), &mockClient)
+	err := config.ValidateL2Config(context.TODO(), &mockClient, false)
 	assert.NoError(t, err)
 }
 
@@ -229,10 +353,10 @@ func TestValidateL2ConfigInvalidChainIdFails(t *testing.T) {
 	config.Genesis.L2.Number = 100
 	config.Genesis.L2.Hash = [32]byte{0x01}
 	mockClient := mockL2Client{chainID: big.NewInt(100), Hash: common.Hash{0x01}}
-	err := config.ValidateL2Config(context.TODO(), &mockClient)
+	err := config.ValidateL2Config(context.TODO(), &mockClient, false)
 	assert.Error(t, err)
 	config.L2ChainID = big.NewInt(99)
-	err = config.ValidateL2Config(context.TODO(), &mockClient)
+	err = config.ValidateL2Config(context.TODO(), &mockClient, false)
 	assert.Error(t, err)
 }
 
@@ -242,11 +366,24 @@ func TestValidateL2ConfigInvalidGenesisHashFails(t *testing.T) {
 	config.Genesis.L2.Number = 100
 	config.Genesis.L2.Hash = [32]byte{0x00}
 	mockClient := mockL2Client{chainID: big.NewInt(100), Hash: common.Hash{0x01}}
-	err := config.ValidateL2Config(context.TODO(), &mockClient)
+	err := config.ValidateL2Config(context.TODO(), &mockClient, false)
 	assert.Error(t, err)
 	config.Genesis.L2.Hash = [32]byte{0x02}
-	err = config.ValidateL2Config(context.TODO(), &mockClient)
+	err = config.ValidateL2Config(context.TODO(), &mockClient, false)
 	assert.Error(t, err)
+}
+
+func TestValidateL2ConfigInvalidGenesisHashSkippedWhenRequested(t *testing.T) {
+	config := randConfig()
+	config.L2ChainID = big.NewInt(100)
+	config.Genesis.L2.Number = 100
+	config.Genesis.L2.Hash = [32]byte{0x00}
+	mockClient := mockL2Client{chainID: big.NewInt(100), Hash: common.Hash{0x01}}
+	err := config.ValidateL2Config(context.TODO(), &mockClient, true)
+	assert.NoError(t, err)
+	config.Genesis.L2.Hash = [32]byte{0x02}
+	err = config.ValidateL2Config(context.TODO(), &mockClient, true)
+	assert.NoError(t, err)
 }
 
 func TestCheckL2ChainID(t *testing.T) {
@@ -287,8 +424,8 @@ func TestConfig_Check(t *testing.T) {
 			expectedErr: ErrBlockTimeZero,
 		},
 		{
-			name:        "ChannelTimeoutZero",
-			modifier:    func(cfg *Config) { cfg.ChannelTimeout = 0 },
+			name:        "ChannelTimeoutBedrockZero",
+			modifier:    func(cfg *Config) { cfg.ChannelTimeoutBedrock = 0 },
 			expectedErr: ErrMissingChannelTimeout,
 		},
 		{
@@ -325,11 +462,6 @@ func TestConfig_Check(t *testing.T) {
 			name:        "NoBatcherAddr",
 			modifier:    func(cfg *Config) { cfg.Genesis.SystemConfig.BatcherAddr = common.Address{} },
 			expectedErr: ErrMissingBatcherAddr,
-		},
-		{
-			name:        "NoOverhead",
-			modifier:    func(cfg *Config) { cfg.Genesis.SystemConfig.Overhead = eth.Bytes32{} },
-			expectedErr: ErrMissingOverhead,
 		},
 		{
 			name:        "NoScalar",
@@ -392,7 +524,280 @@ func TestConfig_Check(t *testing.T) {
 			cfg := randConfig()
 			test.modifier(cfg)
 			err := cfg.Check()
-			assert.Same(t, err, test.expectedErr)
+			assert.ErrorIs(t, err, test.expectedErr)
+		})
+	}
+
+	forkTests := []struct {
+		name        string
+		modifier    func(cfg *Config)
+		expectedErr error
+	}{
+		{
+			name: "PriorForkMissing",
+			modifier: func(cfg *Config) {
+				ecotoneTime := uint64(1)
+				cfg.EcotoneTime = &ecotoneTime
+			},
+			expectedErr: fmt.Errorf("fork ecotone set (to 1), but prior fork delta missing"),
+		},
+		{
+			name: "PriorForkHasHigherOffset",
+			modifier: func(cfg *Config) {
+				regolithTime := uint64(2)
+				canyonTime := uint64(1)
+				cfg.RegolithTime = &regolithTime
+				cfg.CanyonTime = &canyonTime
+			},
+			expectedErr: fmt.Errorf("fork canyon set to 1, but prior fork regolith has higher offset 2"),
+		},
+		{
+			name: "PriorForkOK",
+			modifier: func(cfg *Config) {
+				regolithTime := uint64(1)
+				canyonTime := uint64(2)
+				deltaTime := uint64(3)
+				ecotoneTime := uint64(4)
+				fjordTime := uint64(5)
+				graniteTime := uint64(6)
+				holoceneTime := uint64(7)
+				isthmusTime := uint64(8)
+				interopTime := uint64(9)
+				cfg.RegolithTime = &regolithTime
+				cfg.CanyonTime = &canyonTime
+				cfg.DeltaTime = &deltaTime
+				cfg.EcotoneTime = &ecotoneTime
+				cfg.FjordTime = &fjordTime
+				cfg.GraniteTime = &graniteTime
+				cfg.HoloceneTime = &holoceneTime
+				cfg.IsthmusTime = &isthmusTime
+				cfg.InteropTime = &interopTime
+			},
+			expectedErr: nil,
+		},
+	}
+
+	for _, test := range forkTests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := randConfig()
+			test.modifier(cfg)
+			err := cfg.Check()
+			assert.Equal(t, err, test.expectedErr)
+		})
+	}
+}
+
+func TestTimestampForBlock(t *testing.T) {
+	config := randConfig()
+
+	tests := []struct {
+		name              string
+		genesisTime       uint64
+		genesisBlock      uint64
+		blockTime         uint64
+		blockNum          uint64
+		expectedBlockTime uint64
+	}{
+		{
+			name:              "FirstBlock",
+			genesisTime:       100,
+			genesisBlock:      0,
+			blockTime:         2,
+			blockNum:          0,
+			expectedBlockTime: 100,
+		},
+		{
+			name:              "SecondBlock",
+			genesisTime:       100,
+			genesisBlock:      0,
+			blockTime:         2,
+			blockNum:          1,
+			expectedBlockTime: 102,
+		},
+		{
+			name:              "NBlock",
+			genesisTime:       100,
+			genesisBlock:      0,
+			blockTime:         2,
+			blockNum:          25,
+			expectedBlockTime: 150,
+		},
+	}
+
+	for _, test := range tests {
+		test := test
+		t.Run(fmt.Sprintf("TestTimestampForBlock_%s", test.name), func(t *testing.T) {
+			config.Genesis.L2Time = test.genesisTime
+			config.Genesis.L2.Number = test.genesisBlock
+			config.BlockTime = test.blockTime
+
+			timestamp := config.TimestampForBlock(test.blockNum)
+			assert.Equal(t, timestamp, test.expectedBlockTime)
+		})
+	}
+}
+
+func TestForkchoiceUpdatedVersion(t *testing.T) {
+	config := randConfig()
+	tests := []struct {
+		name           string
+		canyonTime     uint64
+		ecotoneTime    uint64
+		attrs          *eth.PayloadAttributes
+		expectedMethod eth.EngineAPIMethod
+	}{
+		{
+			name:           "NoAttrs",
+			canyonTime:     10,
+			ecotoneTime:    20,
+			attrs:          nil,
+			expectedMethod: eth.FCUV3,
+		},
+		{
+			name:           "BeforeCanyon",
+			canyonTime:     10,
+			ecotoneTime:    20,
+			attrs:          &eth.PayloadAttributes{Timestamp: 5},
+			expectedMethod: eth.FCUV1,
+		},
+		{
+			name:           "Canyon",
+			canyonTime:     10,
+			ecotoneTime:    20,
+			attrs:          &eth.PayloadAttributes{Timestamp: 15},
+			expectedMethod: eth.FCUV2,
+		},
+		{
+			name:           "Ecotone",
+			canyonTime:     10,
+			ecotoneTime:    20,
+			attrs:          &eth.PayloadAttributes{Timestamp: 25},
+			expectedMethod: eth.FCUV3,
+		},
+	}
+
+	for _, test := range tests {
+		test := test
+		t.Run(fmt.Sprintf("TestForkchoiceUpdatedVersion_%s", test.name), func(t *testing.T) {
+			config.CanyonTime = &test.canyonTime
+			config.EcotoneTime = &test.ecotoneTime
+			assert.Equal(t, config.ForkchoiceUpdatedVersion(test.attrs), test.expectedMethod)
+		})
+	}
+}
+
+func TestNewPayloadVersion(t *testing.T) {
+	config := randConfig()
+	canyonTime := uint64(0)
+	config.CanyonTime = &canyonTime
+	tests := []struct {
+		name           string
+		ecotoneTime    uint64
+		payloadTime    uint64
+		expectedMethod eth.EngineAPIMethod
+	}{
+		{
+			name:           "BeforeEcotone",
+			ecotoneTime:    10,
+			payloadTime:    5,
+			expectedMethod: eth.NewPayloadV2,
+		},
+		{
+			name:           "Ecotone",
+			ecotoneTime:    10,
+			payloadTime:    15,
+			expectedMethod: eth.NewPayloadV3,
+		},
+	}
+
+	for _, test := range tests {
+		test := test
+		t.Run(fmt.Sprintf("TestNewPayloadVersion_%s", test.name), func(t *testing.T) {
+			config.EcotoneTime = &test.ecotoneTime
+			assert.Equal(t, config.NewPayloadVersion(test.payloadTime), test.expectedMethod)
+		})
+	}
+}
+
+func TestGetPayloadVersion(t *testing.T) {
+	config := randConfig()
+	canyonTime := uint64(0)
+	config.CanyonTime = &canyonTime
+	tests := []struct {
+		name           string
+		ecotoneTime    uint64
+		payloadTime    uint64
+		expectedMethod eth.EngineAPIMethod
+	}{
+		{
+			name:           "BeforeEcotone",
+			ecotoneTime:    10,
+			payloadTime:    5,
+			expectedMethod: eth.GetPayloadV2,
+		},
+		{
+			name:           "Ecotone",
+			ecotoneTime:    10,
+			payloadTime:    15,
+			expectedMethod: eth.GetPayloadV3,
+		},
+	}
+
+	for _, test := range tests {
+		test := test
+		t.Run(fmt.Sprintf("TestGetPayloadVersion_%s", test.name), func(t *testing.T) {
+			config.EcotoneTime = &test.ecotoneTime
+			assert.Equal(t, config.GetPayloadVersion(test.payloadTime), test.expectedMethod)
+		})
+	}
+}
+
+func TestConfig_IsActivationBlock(t *testing.T) {
+	ts := uint64(42)
+	// TODO(12490): Currently only supports Holocene. Will be modularized in a follow-up.
+	for _, fork := range []ForkName{Holocene} {
+		cfg := &Config{
+			HoloceneTime: &ts,
+		}
+		require.Equal(t, fork, cfg.IsActivationBlock(0, ts))
+		require.Equal(t, fork, cfg.IsActivationBlock(0, ts+64))
+		require.Equal(t, fork, cfg.IsActivationBlock(ts-1, ts))
+		require.Equal(t, fork, cfg.IsActivationBlock(ts-1, ts+1))
+		require.Zero(t, cfg.IsActivationBlock(0, ts-1))
+		require.Zero(t, cfg.IsActivationBlock(ts, ts+1))
+	}
+}
+
+func TestConfigImplementsBlockType(t *testing.T) {
+	config := randConfig()
+	isthmusTime := uint64(100)
+	config.IsthmusTime = &isthmusTime
+	tests := []struct {
+		name                       string
+		blockTime                  uint64
+		hasOptimismWithdrawalsRoot bool
+	}{
+		{
+			name:                       "BeforeIsthmus",
+			blockTime:                  uint64(99),
+			hasOptimismWithdrawalsRoot: false,
+		},
+		{
+			name:                       "AtIsthmus",
+			blockTime:                  uint64(100),
+			hasOptimismWithdrawalsRoot: true,
+		},
+		{
+			name:                       "AfterIsthmus",
+			blockTime:                  uint64(200),
+			hasOptimismWithdrawalsRoot: true,
+		},
+	}
+
+	for _, test := range tests {
+		test := test
+		t.Run(fmt.Sprintf("TestHasOptimismWithdrawalsRoot_%s", test.name), func(t *testing.T) {
+			assert.Equal(t, config.HasOptimismWithdrawalsRoot(test.blockTime), test.hasOptimismWithdrawalsRoot)
 		})
 	}
 }

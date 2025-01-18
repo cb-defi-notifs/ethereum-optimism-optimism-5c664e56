@@ -8,8 +8,8 @@ import (
 	"time"
 
 	"github.com/ethereum-optimism/optimism/op-node/p2p/monitor/mocks"
-	"github.com/ethereum-optimism/optimism/op-node/testlog"
 	clock2 "github.com/ethereum-optimism/optimism/op-service/clock"
+	"github.com/ethereum-optimism/optimism/op-service/testlog"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/stretchr/testify/require"
@@ -18,7 +18,7 @@ import (
 const testBanDuration = 2 * time.Hour
 
 func peerMonitorSetup(t *testing.T) (*PeerMonitor, *clock2.DeterministicClock, *mocks.PeerManager) {
-	l := testlog.Logger(t, log.LvlInfo)
+	l := testlog.Logger(t, log.LevelInfo)
 	clock := clock2.NewDeterministicClock(time.UnixMilli(10000))
 	manager := mocks.NewPeerManager(t)
 	monitor := NewPeerMonitor(context.Background(), l, clock, manager, -100, testBanDuration)
@@ -30,10 +30,15 @@ func TestPeriodicallyCheckNextPeer(t *testing.T) {
 	// Each time a step is performed, it calls Done on the wait group so we can wait for it to be performed
 	stepCh := make(chan struct{}, 10)
 	monitor.bgTasks.Add(1)
-	var actionErr error
+	actionErr := make(chan error, 1)
 	go monitor.background(func() error {
 		stepCh <- struct{}{}
-		return actionErr
+		select {
+		case err := <-actionErr:
+			return err
+		default:
+			return nil
+		}
 	})
 	defer monitor.Stop()
 	// Wait for the step ticker to be started
@@ -47,7 +52,7 @@ func TestPeriodicallyCheckNextPeer(t *testing.T) {
 	}
 
 	// Should continue executing periodically even after an error
-	actionErr = errors.New("boom")
+	actionErr <- errors.New("boom")
 	for i := 0; i < 5; i++ {
 		clock.AdvanceTime(checkInterval)
 		waitForChan(t, stepCh, fmt.Sprintf("Did not perform step %v", i))

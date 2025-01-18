@@ -6,92 +6,20 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
-	"time"
 
-	"github.com/ethereum-optimism/optimism/op-e2e/e2eutils"
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
-	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/ethereum/go-ethereum/ethclient/gethclient"
 
-	"github.com/ethereum-optimism/optimism/op-bindings/bindings"
-	"github.com/ethereum-optimism/optimism/op-bindings/predeploys"
+	"github.com/ethereum-optimism/optimism/op-node/bindings"
+	bindingspreview "github.com/ethereum-optimism/optimism/op-node/bindings/preview"
+	"github.com/ethereum-optimism/optimism/op-service/predeploys"
 )
 
 var MessagePassedTopic = crypto.Keccak256Hash([]byte("MessagePassed(uint256,address,address,uint256,uint256,bytes,bytes32)"))
-
-// WaitForOutputRootPublished waits until there is an output published for an L2 block number larger than the supplied l2BlockNumber
-// This function polls and can block for a very long time if used on mainnet.
-// This returns the block number to use for proof generation.
-func WaitForOutputRootPublished(ctx context.Context, client *ethclient.Client, portalAddr common.Address, l2BlockNumber *big.Int) (uint64, error) {
-	l2BlockNumber = new(big.Int).Set(l2BlockNumber) // Don't clobber caller owned l2BlockNumber
-	opts := &bind.CallOpts{Context: ctx}
-
-	l2OO, err := createL2OOCaller(ctx, client, portalAddr)
-	if err != nil {
-		return 0, err
-	}
-
-	getL2BlockFromLatestOutput := func() (*big.Int, error) { return l2OO.LatestBlockNumber(opts) }
-	outputBlockNum, err := e2eutils.WaitAndGet[*big.Int](ctx, time.Second, getL2BlockFromLatestOutput, func(latest *big.Int) bool {
-		return latest.Cmp(l2BlockNumber) >= 0
-	})
-	if err != nil {
-		return 0, err
-	}
-	return outputBlockNum.Uint64(), nil
-}
-
-// WaitForFinalizationPeriod waits until the L1 chain has progressed far enough that l1ProvingBlockNum has completed
-// the finalization period.
-// This functions polls and can block for a very long time if used on mainnet.
-func WaitForFinalizationPeriod(ctx context.Context, client *ethclient.Client, portalAddr common.Address, l1ProvingBlockNum *big.Int) error {
-	l1ProvingBlockNum = new(big.Int).Set(l1ProvingBlockNum) // Don't clobber caller owned l1ProvingBlockNum
-	opts := &bind.CallOpts{Context: ctx}
-
-	// Load finalization period
-	l2OO, err := createL2OOCaller(ctx, client, portalAddr)
-	if err != nil {
-		return fmt.Errorf("create L2OOCaller: %w", err)
-	}
-	finalizationPeriod, err := l2OO.FINALIZATIONPERIODSECONDS(opts)
-	if err != nil {
-		return fmt.Errorf("get finalization period: %w", err)
-	}
-
-	provingHeader, err := client.HeaderByNumber(ctx, l1ProvingBlockNum)
-	if err != nil {
-		return fmt.Errorf("retrieve proving header: %w", err)
-	}
-
-	targetTimestamp := new(big.Int).Add(new(big.Int).SetUint64(provingHeader.Time), finalizationPeriod)
-	targetTime := time.Unix(targetTimestamp.Int64(), 0)
-	// Assume clock is relatively correct
-	time.Sleep(time.Until(targetTime))
-	// Poll for L1 Block to have a time greater than the target time
-	return e2eutils.WaitFor(ctx, time.Second, func() (bool, error) {
-		header, err := client.HeaderByNumber(ctx, nil)
-		if err != nil {
-			return false, fmt.Errorf("retrieve latest header: %w", err)
-		}
-		return header.Time > targetTimestamp.Uint64(), nil
-	})
-}
-
-func createL2OOCaller(ctx context.Context, client *ethclient.Client, portalAddr common.Address) (*bindings.L2OutputOracleCaller, error) {
-	portal, err := bindings.NewOptimismPortalCaller(portalAddr, client)
-	if err != nil {
-		return nil, fmt.Errorf("create OptimismPortalCaller: %w", err)
-	}
-	l2OOAddress, err := portal.L2ORACLE(&bind.CallOpts{Context: ctx})
-	if err != nil {
-		return nil, fmt.Errorf("create L2ORACLE: %w", err)
-	}
-	return bindings.NewL2OutputOracleCaller(l2OOAddress, client)
-}
 
 type ProofClient interface {
 	GetProof(context.Context, common.Address, []string, *big.Int) (*gethclient.AccountResult, error)
@@ -99,6 +27,10 @@ type ProofClient interface {
 
 type ReceiptClient interface {
 	TransactionReceipt(context.Context, common.Hash) (*types.Receipt, error)
+}
+
+type HeaderClient interface {
+	HeaderByNumber(context.Context, *big.Int) (*types.Header, error)
 }
 
 // ProvenWithdrawalParameters is the set of parameters to pass to the ProveWithdrawalTransaction
@@ -115,10 +47,36 @@ type ProvenWithdrawalParameters struct {
 	WithdrawalProof [][]byte // List of trie nodes to prove L2 storage
 }
 
-// ProveWithdrawalParameters queries L1 & L2 to generate all withdrawal parameters and proof necessary to prove a withdrawal on L1.
-// The header provided is very important. It should be a block (timestamp) for which there is a submitted output in the L2 Output Oracle
+// ProveWithdrawalParameters calls ProveWithdrawalParametersForBlock with the most recent L2 output after the given header.
+func ProveWithdrawalParameters(ctx context.Context, proofCl ProofClient, l2ReceiptCl ReceiptClient, txHash common.Hash, l2Header *types.Header, l2OutputOracleContract *bindings.L2OutputOracleCaller) (ProvenWithdrawalParameters, error) {
+	l2OutputIndex, err := l2OutputOracleContract.GetL2OutputIndexAfter(&bind.CallOpts{}, l2Header.Number)
+	if err != nil {
+		return ProvenWithdrawalParameters{}, fmt.Errorf("failed to get l2OutputIndex: %w", err)
+	}
+	return ProveWithdrawalParametersForBlock(ctx, proofCl, l2ReceiptCl, txHash, l2Header, l2OutputIndex)
+}
+
+// ProveWithdrawalParametersFaultProofs calls ProveWithdrawalParametersForBlock with the most recent L2 output after the latest game.
+func ProveWithdrawalParametersFaultProofs(ctx context.Context, proofCl ProofClient, l2ReceiptCl ReceiptClient, l2HeaderCl HeaderClient, txHash common.Hash, disputeGameFactoryContract *bindings.DisputeGameFactoryCaller, optimismPortal2Contract *bindingspreview.OptimismPortal2Caller) (ProvenWithdrawalParameters, error) {
+	latestGame, err := FindLatestGame(ctx, disputeGameFactoryContract, optimismPortal2Contract)
+	if err != nil {
+		return ProvenWithdrawalParameters{}, fmt.Errorf("failed to find latest game: %w", err)
+	}
+
+	l2BlockNumber := new(big.Int).SetBytes(latestGame.ExtraData[0:32])
+	l2OutputIndex := latestGame.Index
+	// Fetch the block header from the L2 node
+	l2Header, err := l2HeaderCl.HeaderByNumber(ctx, l2BlockNumber)
+	if err != nil {
+		return ProvenWithdrawalParameters{}, fmt.Errorf("failed to get l2Block: %w", err)
+	}
+	return ProveWithdrawalParametersForBlock(ctx, proofCl, l2ReceiptCl, txHash, l2Header, l2OutputIndex)
+}
+
+// ProveWithdrawalParametersForBlock queries L1 & L2 to generate all withdrawal parameters and proof necessary to prove a withdrawal on L1.
+// The l2Header provided is very important. It should be a block for which there is a submitted output in the L2 Output Oracle
 // contract. If not, the withdrawal will fail as it the storage proof cannot be verified if there is no submitted state root.
-func ProveWithdrawalParameters(ctx context.Context, proofCl ProofClient, l2ReceiptCl ReceiptClient, txHash common.Hash, header *types.Header, l2OutputOracleContract *bindings.L2OutputOracleCaller) (ProvenWithdrawalParameters, error) {
+func ProveWithdrawalParametersForBlock(ctx context.Context, proofCl ProofClient, l2ReceiptCl ReceiptClient, txHash common.Hash, l2Header *types.Header, l2OutputIndex *big.Int) (ProvenWithdrawalParameters, error) {
 	// Transaction receipt
 	receipt, err := l2ReceiptCl.TransactionReceipt(ctx, txHash)
 	if err != nil {
@@ -129,6 +87,13 @@ func ProveWithdrawalParameters(ctx context.Context, proofCl ProofClient, l2Recei
 	if err != nil {
 		return ProvenWithdrawalParameters{}, err
 	}
+	return ProveWithdrawalParametersForEvent(ctx, proofCl, ev, l2Header, l2OutputIndex)
+}
+
+// ProveWithdrawalParametersForEvent queries L1 to generate all withdrawal parameters and proof necessary to prove a withdrawal on L1.
+// The l2Header provided is very important. It should be a block for which there is a submitted output in the L2 Output Oracle
+// contract. If not, the withdrawal will fail as it the storage proof cannot be verified if there is no submitted state root.
+func ProveWithdrawalParametersForEvent(ctx context.Context, proofCl ProofClient, ev *bindings.L2ToL1MessagePasserMessagePassed, l2Header *types.Header, l2OutputIndex *big.Int) (ProvenWithdrawalParameters, error) {
 	// Generate then verify the withdrawal proof
 	withdrawalHash, err := WithdrawalHash(ev)
 	if !bytes.Equal(withdrawalHash[:], ev.WithdrawalHash[:]) {
@@ -138,23 +103,18 @@ func ProveWithdrawalParameters(ctx context.Context, proofCl ProofClient, l2Recei
 		return ProvenWithdrawalParameters{}, err
 	}
 	slot := StorageSlotOfWithdrawalHash(withdrawalHash)
-	p, err := proofCl.GetProof(ctx, predeploys.L2ToL1MessagePasserAddr, []string{slot.String()}, header.Number)
-	if err != nil {
-		return ProvenWithdrawalParameters{}, err
-	}
 
-	// Fetch the L2OutputIndex from the L2 Output Oracle caller (on L1)
-	l2OutputIndex, err := l2OutputOracleContract.GetL2OutputIndexAfter(&bind.CallOpts{}, header.Number)
-	if err != nil {
-		return ProvenWithdrawalParameters{}, fmt.Errorf("failed to get l2OutputIndex: %w", err)
-	}
-	// TODO: Could skip this step, but it's nice to double check it
-	err = VerifyProof(header.Root, p)
+	p, err := proofCl.GetProof(ctx, predeploys.L2ToL1MessagePasserAddr, []string{slot.String()}, l2Header.Number)
 	if err != nil {
 		return ProvenWithdrawalParameters{}, err
 	}
 	if len(p.StorageProof) != 1 {
 		return ProvenWithdrawalParameters{}, errors.New("invalid amount of storage proofs")
+	}
+
+	err = VerifyProof(l2Header.Root, p)
+	if err != nil {
+		return ProvenWithdrawalParameters{}, err
 	}
 
 	// Encode it as expected by the contract
@@ -173,12 +133,40 @@ func ProveWithdrawalParameters(ctx context.Context, proofCl ProofClient, l2Recei
 		Data:          ev.Data,
 		OutputRootProof: bindings.TypesOutputRootProof{
 			Version:                  [32]byte{}, // Empty for version 1
-			StateRoot:                header.Root,
+			StateRoot:                l2Header.Root,
 			MessagePasserStorageRoot: p.StorageHash,
-			LatestBlockhash:          header.Hash(),
+			LatestBlockhash:          l2Header.Hash(),
 		},
 		WithdrawalProof: trieNodes,
 	}, nil
+}
+
+// FindLatestGame finds the latest game in the DisputeGameFactory contract.
+func FindLatestGame(ctx context.Context, disputeGameFactoryContract *bindings.DisputeGameFactoryCaller, optimismPortal2Contract *bindingspreview.OptimismPortal2Caller) (*bindings.IDisputeGameFactoryGameSearchResult, error) {
+	respectedGameType, err := optimismPortal2Contract.RespectedGameType(&bind.CallOpts{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to get respected game type: %w", err)
+	}
+
+	gameCount, err := disputeGameFactoryContract.GameCount(&bind.CallOpts{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to get game count: %w", err)
+	}
+	if gameCount.Cmp(common.Big0) == 0 {
+		return nil, errors.New("no games")
+	}
+
+	searchStart := new(big.Int).Sub(gameCount, common.Big1)
+	latestGames, err := disputeGameFactoryContract.FindLatestGames(&bind.CallOpts{}, respectedGameType, searchStart, common.Big1)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get latest games: %w", err)
+	}
+	if len(latestGames) == 0 {
+		return nil, errors.New("no latest games")
+	}
+
+	latestGame := latestGames[0]
+	return &latestGame, nil
 }
 
 // Standard ABI types copied from golang ABI tests
@@ -215,11 +203,23 @@ func WithdrawalHash(ev *bindings.L2ToL1MessagePasserMessagePassed) (common.Hash,
 // a transaction receipt. It does not support multiple withdrawals
 // per receipt.
 func ParseMessagePassed(receipt *types.Receipt) (*bindings.L2ToL1MessagePasserMessagePassed, error) {
+	events, err := ParseMessagesPassed(receipt)
+	if err != nil {
+		return nil, err
+	}
+	return events[0], nil
+}
+
+// ParseMessagesPassed parses MessagePassed events from
+// a transaction receipt. It supports multiple withdrawals
+// per receipt.
+func ParseMessagesPassed(receipt *types.Receipt) ([]*bindings.L2ToL1MessagePasserMessagePassed, error) {
 	contract, err := bindings.NewL2ToL1MessagePasser(common.Address{}, nil)
 	if err != nil {
 		return nil, err
 	}
 
+	var events []*bindings.L2ToL1MessagePasserMessagePassed
 	for _, log := range receipt.Logs {
 		if len(log.Topics) == 0 || log.Topics[0] != MessagePassedTopic {
 			continue
@@ -229,9 +229,12 @@ func ParseMessagePassed(receipt *types.Receipt) (*bindings.L2ToL1MessagePasserMe
 		if err != nil {
 			return nil, fmt.Errorf("failed to parse log: %w", err)
 		}
-		return ev, nil
+		events = append(events, ev)
 	}
-	return nil, errors.New("Unable to find MessagePassed event")
+	if len(events) == 0 {
+		return nil, errors.New("unable to find MessagePassed event")
+	}
+	return events, nil
 }
 
 // StorageSlotOfWithdrawalHash determines the storage slot of the L2ToL1MessagePasser contract to look at

@@ -1,127 +1,199 @@
-# Optimism Smart Contracts (Bedrock)
+# OP Stack Smart Contracts
 
-[![codecov](https://codecov.io/gh/ethereum-optimism/optimism/branch/develop/graph/badge.svg?token=0VTG7PG7YR&flag=contracts-bedrock-tests)](https://codecov.io/gh/ethereum-optimism/optimism)
+This package contains the L1 and L2 smart contracts for the OP Stack.
+Detailed specifications for the contracts contained within this package can be found at [specs.optimism.io](https://specs.optimism.io).
+High-level information about these contracts can be found within this README and within the [Optimism Developer Docs](https://docs.optimism.io).
 
-This package contains the smart contracts that compose the on-chain component of Optimism's upcoming Bedrock upgrade.
-We've tried to maintain 100% backwards compatibility with the existing system while also introducing new useful features.
-You can find detailed specifications for the contracts contained within this package [here](../../specs).
+<!-- START doctoc generated TOC please keep comment here to allow auto update -->
+<!-- DON'T EDIT THIS SECTION, INSTEAD RE-RUN doctoc TO UPDATE -->
+## Table of Contents
 
-A style guide we follow for writing contracts can be found [here](./STYLE_GUIDE.md).
+- [Architecture Overview](#architecture-overview)
+- [External Usage](#external-usage)
+  - [Using OP Stack Contracts in Solidity](#using-op-stack-contracts-in-solidity)
+  - [Using OP Stack Contracts in JavaScript](#using-op-stack-contracts-in-javascript)
+  - [Deployed Addresses](#deployed-addresses)
+- [Contributing](#contributing)
+  - [Contributing Guide](#contributing-guide)
+  - [Style Guide](#style-guide)
+  - [Contract Interfaces](#contract-interfaces)
+  - [Solidity Versioning](#solidity-versioning)
+- [Deployment](#deployment)
+  - [Deploying Production Networks](#deploying-production-networks)
+- [Generating L2 Genesis Allocs](#generating-l2-genesis-allocs)
+  - [Configuration](#configuration)
+    - [Custom Gas Token](#custom-gas-token)
+  - [Execution](#execution)
+  - [Deploying a single contract](#deploying-a-single-contract)
+- [Testing](#testing)
+  - [Test Setup](#test-setup)
+  - [Static Analysis](#static-analysis)
 
-## Contracts Overview
+<!-- END doctoc generated TOC please keep comment here to allow auto update -->
 
-### Contracts deployed to L1
+## Architecture Overview
 
-| Name                                                                                     | Proxy Type                                                              | Description                                                                                         |
-| ---------------------------------------------------------------------------------------- | ----------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
-| [`L1CrossDomainMessenger`](../../specs/messengers.md)                                    | [`ResolvedDelegateProxy`](./contracts/legacy/ResolvedDelegateProxy.sol) | High-level interface for sending messages to and receiving messages from Optimism                   |
-| [`L1StandardBridge`](../../specs/bridges.md)                                             | [`L1ChugSplashProxy`](./contracts/legacy/L1ChugSplashProxy.sol)         | Standardized system for transfering ERC20 tokens to/from Optimism                                   |
-| [`L2OutputOracle`](../../specs/proposals.md#l2-output-oracle-smart-contract)             | [`Proxy`](./contracts/universal/Proxy.sol)                              | Stores commitments to the state of Optimism which can be used by contracts on L1 to access L2 state |
-| [`OptimismPortal`](../../specs/deposits.md#deposit-contract)                             | [`Proxy`](./contracts/universal/Proxy.sol)                              | Low-level message passing interface                                                                 |
-| [`OptimismMintableERC20Factory`](../../specs/predeploys.md#optimismmintableerc20factory) | [`Proxy`](./contracts/universal/Proxy.sol)                              | Deploys standard `OptimismMintableERC20` tokens that are compatible with either `StandardBridge`    |
-| [`ProxyAdmin`](../../specs/TODO)                                                         | -                                                                       | Contract that can upgrade L1 contracts                                                              |
+Refer to the [Optimism Overview page within the OP Stack Specs](https://specs.optimism.io/protocol/overview.html#architecture-overview) for a detailed architecture overview of core L1 contracts, core L2 contracts, and smart contract proxies.
 
-### Contracts deployed to L2
+## External Usage
 
-| Name                                                                                     | Proxy Type                                 | Description                                                                                      |
-| ---------------------------------------------------------------------------------------- | ------------------------------------------ | ------------------------------------------------------------------------------------------------ |
-| [`GasPriceOracle`](../../specs/predeploys.md#ovm_gaspriceoracle)                         | [`Proxy`](./contracts/universal/Proxy.sol) | Stores L2 gas price configuration values                                                         |
-| [`L1Block`](../../specs/predeploys.md#l1block)                                           | [`Proxy`](./contracts/universal/Proxy.sol) | Stores L1 block context information (e.g., latest known L1 block hash)                           |
-| [`L2CrossDomainMessenger`](../../specs/predeploys.md#l2crossdomainmessenger)             | [`Proxy`](./contracts/universal/Proxy.sol) | High-level interface for sending messages to and receiving messages from L1                      |
-| [`L2StandardBridge`](../../specs/predeploys.md#l2standardbridge)                         | [`Proxy`](./contracts/universal/Proxy.sol) | Standardized system for transferring ERC20 tokens to/from L1                                     |
-| [`L2ToL1MessagePasser`](../../specs/predeploys.md#ovm_l2tol1messagepasser)               | [`Proxy`](./contracts/universal/Proxy.sol) | Low-level message passing interface                                                              |
-| [`SequencerFeeVault`](../../specs/predeploys.md#sequencerfeevault)                       | [`Proxy`](./contracts/universal/Proxy.sol) | Vault for L2 transaction fees                                                                    |
-| [`OptimismMintableERC20Factory`](../../specs/predeploys.md#optimismmintableerc20factory) | [`Proxy`](./contracts/universal/Proxy.sol) | Deploys standard `OptimismMintableERC20` tokens that are compatible with either `StandardBridge` |
-| [`L2ProxyAdmin`](../../specs/TODO)                                                       | -                                          | Contract that can upgrade L2 contracts when sent a transaction from L1                           |
+### Using OP Stack Contracts in Solidity
 
-### Legacy and deprecated contracts
+OP Stack smart contracts are published to NPM and can be installed via:
 
-| Name                                                            | Location | Proxy Type                                 | Description                                                                           |
-| --------------------------------------------------------------- | -------- | ------------------------------------------ | ------------------------------------------------------------------------------------- |
-| [`AddressManager`](./contracts/legacy/AddressManager.sol)       | L1       | -                                          | Legacy upgrade mechanism (unused in Bedrock)                                          |
-| [`DeployerWhitelist`](./contracts/legacy/DeployerWhitelist.sol) | L2       | [`Proxy`](./contracts/universal/Proxy.sol) | Legacy contract for managing allowed deployers (unused since EVM Equivalence upgrade) |
-| [`L1BlockNumber`](./contracts/legacy/L1BlockNumber.sol)         | L2       | [`Proxy`](./contracts/universal/Proxy.sol) | Legacy contract for accessing latest known L1 block number, replaced by `L1Block`     |
-
-## Installation
-
-We export contract ABIs, contract source code, and contract deployment information for this package via `npm`:
-
-```shell
+```sh
 npm install @eth-optimism/contracts-bedrock
 ```
 
-## Development
+Refer to the [Optimism Developer Docs](https://docs.optimism.io/builders/dapp-developers/contracts/system-contracts#using-system-contracts-in-solidity) for additional information about how to use this package.
 
-### Dependencies
+### Using OP Stack Contracts in JavaScript
 
-We work on this repository with a combination of [Hardhat](https://hardhat.org) and [Foundry](https://getfoundry.sh/).
+Contract ABIs and addresses are published to NPM in a separate package and can be installed via:
 
-1. Install node modules with pnpm (v8) and Node.js (16+):
-
-```shell
-pnpm install
+```sh
+npm install @eth-optimism/contracts-ts
 ```
 
-2. Install the correct version of foundry (defined in the .foundryrc file in the root of this repo.
+Refer to the [Optimism Developer Docs](https://docs.optimism.io/builders/dapp-developers/contracts/system-contracts#using-system-contracts-in-javascript) for additional information about how to use this package.
 
-```shell
-pnpm install:foundry
+### Deployed Addresses
+
+See the [Optimism Developer Docs](https://docs.optimism.io/chain/addresses) for the deployed addresses of these smart contracts for OP Mainnet and OP Sepolia.
+
+## Contributing
+
+### Contributing Guide
+
+Contributions to the OP Stack are always welcome.
+Please refer to the [CONTRIBUTING.md](../../CONTRIBUTING.md) for more information about how to contribute to the OP Stack smart contracts.
+
+### Style Guide
+
+OP Stack smart contracts should be written according to the [STYLE_GUIDE.md](./meta/STYLE_GUIDE.md) found within this repository.
+Maintaining a consistent code style makes code easier to review and maintain, ultimately making the development process safer.
+
+### Contract Interfaces
+
+OP Stack smart contracts use contract interfaces in a relatively unique way. Please refer to
+[INTERFACES.md](./meta/INTERFACES.md) to read more about how the OP Stack uses contract interfaces.
+
+### Solidity Versioning
+
+OP Stack smart contracts are designed to utilize a single, consistent Solidity version. Please
+refer to [SOLIDITY_UPGRADES.md](./meta/SOLIDITY_UPGRADES.md) to understand the process for updating to
+newer Solidity versions.
+
+## Deployment
+
+The smart contracts are deployed using `foundry`. The `DEPLOYMENT_OUTFILE` env var will determine the filepath that the
+deployment artifact is written to on disk after the deployment. It comes in the form of a JSON file where keys are
+the names of the contracts and the values are the addresses the contract was deployed to.
+
+The `DEPLOY_CONFIG_PATH` is a filepath to a deploy config file, see the `deploy-config` directory for examples and the
+[DeployConfig](https://github.com/ethereum-optimism/optimism/blob/develop/op-chain-ops/genesis/config.go) definition for
+descriptions of the values.
+If you are following the official deployment tutorial, please make sure to use the `getting-started.json` file.
+
+```bash
+DEPLOYMENT_OUTFILE=deployments/artifact.json \
+DEPLOY_CONFIG_PATH=<PATH_TO_MY_DEPLOY_CONFIG> \
+  forge script scripts/deploy/Deploy.s.sol:Deploy \
+  --broadcast --private-key $PRIVATE_KEY \
+  --rpc-url $ETH_RPC_URL
 ```
 
-### Build
+The `IMPL_SALT` env var can be used to set the `create2` salt for deploying the implementation
+contracts.
 
-```shell
-pnpm build
+This will deploy an entire new system of L1 smart contracts including a new `SuperchainConfig`.
+In the future there will be an easy way to deploy only proxies and use shared implementations
+for each of the contracts as well as a shared `SuperchainConfig` contract.
+
+### Deploying Production Networks
+
+Production users should deploy their L1 contracts from a contracts release.
+All contracts releases are on git tags with the following format: `op-contracts/vX.Y.Z`.
+See the [release process](https://github.com/ethereum-optimism/optimism?tab=readme-ov-file#development-and-release-process)
+for more information.
+
+## Generating L2 Genesis Allocs
+
+A foundry script is used to generate the L2 genesis allocs. This is a JSON file that represents the L2 genesis state.
+The `CONTRACT_ADDRESSES_PATH` env var represents the deployment artifact that was generated during a contract deployment.
+The same deploy config JSON file should be used for L1 contracts deployment as when generating the L2 genesis allocs.
+The `STATE_DUMP_PATH` env var represents the filepath at which the allocs will be written to on disk.
+
+```bash
+CONTRACT_ADDRESSES_PATH=deployments/artifact.json \
+DEPLOY_CONFIG_PATH=<PATH_TO_MY_DEPLOY_CONFIG> \
+STATE_DUMP_PATH=<PATH_TO_WRITE_L2_ALLOCS> \
+  forge script scripts/L2Genesis.s.sol:L2Genesis \
+  --sig 'runWithStateDump()'
 ```
 
-### Tests
-
-```shell
-pnpm test
-```
-
-### Deployment
-
-The smart contracts are deployed using `foundry` with a `hardhat-deploy` compatibility layer. When the contracts are deployed,
-they will write a temp file to disk that can then be formatted into a `hardhat-deploy` style artifact by calling another script.
-
-#### Configuration
+### Configuration
 
 Create or modify a file `<network-name>.json` inside of the [`deploy-config`](./deploy-config/) folder.
-By default, the network name will be selected automatically based on the chainid. Alternatively, the `DEPLOYMENT_CONTEXT` env var can be used to override the network name.
-The spec for the deploy config is defined by the `deployConfigSpec` located inside of the [`hardhat.config.ts`](./hardhat.config.ts).
+Use the env var `DEPLOY_CONFIG_PATH` to use a particular deploy config file at runtime.
 
-#### Execution
+The script will read the latest active fork from the deploy config and the L2 genesis allocs generated will be
+compatible with this fork. The automatically detected fork can be overwritten by setting the environment variable `FORK`
+either to the lower-case fork name (currently `delta`, `ecotone`, `fjord`, `granite`, or `holocene`) or to `latest`,
+which will select the latest fork available (currently `holocene`).
 
-1. Set the env vars `ETH_RPC_URL`, `PRIVATE_KEY` and `ETHERSCAN_API_KEY` if contract verification is desired
-1. Deploy the contracts with `forge script -vvv scripts/Deploy.s.sol:Deploy --rpc-url $ETH_RPC_URL --broadcast --private-key $PRIVATE_KEY`
+By default, the script will dump the L2 genesis allocs of the detected or selected fork only, to the file at `STATE_DUMP_PATH`.
+The optional environment variable `OUTPUT_MODE` allows to modify this behavior by setting it to one of the following values:
+* `latest` (default) - only dump the selected fork's allocs.
+* `all` - also dump all intermediary fork's allocs. This only works if `STATE_DUMP_PATH` is _not_ set. In this case, all allocs
+          will be written to files `/state-dump-<fork>.json`. Another path cannot currently be specified for this use case.
+* `none` - won't dump any allocs. Only makes sense for internal test usage.
+
+#### Custom Gas Token
+
+The Custom Gas Token feature is a Beta feature of the MIT licensed OP Stack.
+While it has received initial review from core contributors, it is still undergoing testing, and may have bugs or other issues.
+
+### Execution
+
+Before deploying the contracts, you can verify the state diff produced by the deploy script using the `runWithStateDiff()` function signature which produces the outputs inside [`snapshots/state-diff/`](./snapshots/state-diff).
+Run the deployment with state diffs by executing: `forge script -vvv scripts/deploy/Deploy.s.sol:Deploy --sig 'runWithStateDiff()' --rpc-url $ETH_RPC_URL --broadcast --private-key $PRIVATE_KEY`.
+
+1. Set the env vars `ETH_RPC_URL`, `PRIVATE_KEY` and `ETHERSCAN_API_KEY` if contract verification is desired.
+1. Set the `DEPLOY_CONFIG_PATH` env var to a path on the filesystem that points to a deploy config.
+1. Deploy the contracts with `forge script -vvv scripts/deploy/Deploy.s.sol:Deploy --rpc-url $ETH_RPC_URL --broadcast --private-key $PRIVATE_KEY`
    Pass the `--verify` flag to verify the deployments automatically with Etherscan.
-1. Generate the hardhat deploy artifacts with `forge script -vvv scripts/Deploy.s.sol:Deploy --sig 'sync()' --rpc-url $ETH_RPC_URL --broadcast --private-key $PRIVATE_KEY`
 
-#### Deploying a single contract
+### Deploying a single contract
 
 All of the functions for deploying a single contract are `public` meaning that the `--sig` argument to `forge script` can be used to
 target the deployment of a single contract.
 
-## Tools
+## Testing
 
-### Layout Locking
+### Test Setup
 
-We use a system called "layout locking" as a safety mechanism to prevent certain contract variables from being moved to different storage slots accidentally.
-To lock a contract variable, add it to the `layout-lock.json` file which has the following format:
+The Solidity unit tests use the same codepaths to set up state that are used in production. The same L1 deploy script is used to deploy the L1 contracts for the in memory tests
+and the L2 state is set up using the same L2 genesis generation code that is used for production and then loaded into foundry via the `vm.loadAllocs` cheatcode. This helps
+to reduce the overhead of maintaining multiple ways to set up the state as well as give additional coverage to the "actual" way that the contracts are deployed.
 
-```json
-{
-  "MyContractName": {
-    "myVariableName": {
-      "slot": 1,
-      "offset": 0,
-      "length": 32
-    }
-  }
-}
-```
+The L1 contract addresses are held in `deployments/hardhat/.deploy` and the L2 test state is held in a `.testdata` directory. The L1 addresses are used to create the L2 state
+and it is possible for stale addresses to be pulled into the L2 state, causing tests to fail. Stale addresses may happen if the order of the L1 deployments happen differently
+since some contracts are deployed using `CREATE`. Run `just clean` and rerun the tests if they are failing for an unknown reason.
 
-With the above config, the `validate-spacers` hardhat task will check that we have a contract called `MyContractName`, that the contract has a variable named `myVariableName`, and that the variable is in the correct position as defined in the lock file.
-You should add things to the `layout-lock.json` file when you want those variables to **never** change.
-Layout locking should be used in combination with diffing the `.storage-layout` file in CI.
+### Static Analysis
+
+`contracts-bedrock` uses [slither](https://github.com/crytic/slither) as its primary static analysis tool.
+Slither will be run against PRs as part of CI, and new findings will be reported as a comment on the PR.
+CI will fail if there are any new findings of medium or higher severity, as configured in the repo's Settings > Code Security and Analysis > Code Scanning > Protection rules setting.
+
+There are two corresponding jobs in CI: one calls "Slither Analysis" and one called "Code scanning results / Slither".
+The former will always pass if Slither runs successfully, and the latter will fail if there are any new findings of medium or higher severity.
+
+Existing findings can be found in the repo's Security tab > [Code Scanning](https://github.com/ethereum-optimism/optimism/security/code-scanning) section.
+You can view findings for a specific PR using the `pr:{number}` filter, such [`pr:9405`](https://github.com/ethereum-optimism/optimism/security/code-scanning?query=is:open+pr:9405).
+
+For each finding, either fix it locally and push a new commit, or dismiss it through the PR comment's UI.
+
+Note that you can run slither locally by running `slither .`, but because it does not contain the triaged results from GitHub, it will be noisy.
+Instead, you should run `slither ./path/to/contract.sol` to run it against a specific file.

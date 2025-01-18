@@ -4,17 +4,18 @@ import (
 	"context"
 	"fmt"
 	"math/big"
+	"slices"
+	"sync"
 	"testing"
 	"time"
 
-	"github.com/ethereum-optimism/optimism/op-node/testlog"
+	"github.com/ethereum-optimism/optimism/op-service/testlog"
 	"github.com/ethereum-optimism/optimism/op-service/txmgr/metrics"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/stretchr/testify/require"
-	"golang.org/x/exp/slices"
 )
 
 type queueFunc func(id int, candidate TxCandidate, receiptCh chan TxReceipt[int], q *Queue[int]) bool
@@ -38,15 +39,6 @@ type testTx struct {
 	sendErr bool // error to return from send for this tx
 }
 
-type testCase struct {
-	name   string        // name of the test
-	max    uint64        // max concurrency of the queue
-	calls  []queueCall   // calls to the queue
-	txs    []testTx      // txs to generate from the factory (and potentially error in send)
-	nonces []uint64      // expected sent tx nonces after all calls are made
-	total  time.Duration // approx. total time it should take to complete all queue calls
-}
-
 type mockBackendWithNonce struct {
 	mockBackend
 }
@@ -64,8 +56,18 @@ func (b *mockBackendWithNonce) NonceAt(ctx context.Context, account common.Addre
 	return uint64(len(b.minedTxs)), nil
 }
 
-func TestSend(t *testing.T) {
-	testCases := []testCase{
+func TestQueue_Send(t *testing.T) {
+	testCases := []struct {
+		name   string      // name of the test
+		max    uint64      // max concurrency of the queue
+		calls  []queueCall // calls to the queue
+		txs    []testTx    // txs to generate from the factory (and potentially error in send)
+		nonces []uint64    // expected sent tx nonces after all calls are made
+		// With Holocene, it is important that transactions are included on chain in the same order as they are sent.
+		// The txmgr.Queue.Send() method should ensure nonces are determined _synchronously_ even if transactions
+		// are otherwise launched asynchronously.
+		confirmedIds []uint // expected tx Ids after all calls are made
+	}{
 		{
 			name: "success",
 			max:  5,
@@ -77,8 +79,8 @@ func TestSend(t *testing.T) {
 				{},
 				{},
 			},
-			nonces: []uint64{0, 1},
-			total:  1 * time.Second,
+			nonces:       []uint64{0, 1},
+			confirmedIds: []uint{0, 1},
 		},
 		{
 			name: "no limit",
@@ -91,8 +93,8 @@ func TestSend(t *testing.T) {
 				{},
 				{},
 			},
-			nonces: []uint64{0, 1},
-			total:  1 * time.Second,
+			nonces:       []uint64{0, 1},
+			confirmedIds: []uint{0, 1},
 		},
 		{
 			name: "single threaded",
@@ -105,8 +107,8 @@ func TestSend(t *testing.T) {
 			txs: []testTx{
 				{},
 			},
-			nonces: []uint64{0},
-			total:  1 * time.Second,
+			nonces:       []uint64{0},
+			confirmedIds: []uint{0},
 		},
 		{
 			name: "single threaded blocking",
@@ -122,8 +124,8 @@ func TestSend(t *testing.T) {
 				{},
 				{},
 			},
-			nonces: []uint64{0, 1, 2},
-			total:  3 * time.Second,
+			nonces:       []uint64{0, 1, 2},
+			confirmedIds: []uint{0, 2, 3},
 		},
 		{
 			name: "dual threaded blocking",
@@ -143,8 +145,8 @@ func TestSend(t *testing.T) {
 				{},
 				{},
 			},
-			nonces: []uint64{0, 1, 2, 3, 4},
-			total:  3 * time.Second,
+			nonces:       []uint64{0, 1, 2, 3, 4},
+			confirmedIds: []uint{0, 1, 3, 4, 5},
 		},
 		{
 			name: "subsequent txs fail after tx failure",
@@ -159,8 +161,8 @@ func TestSend(t *testing.T) {
 				{sendErr: true},
 				{},
 			},
-			nonces: []uint64{0, 1, 1},
-			total:  3 * time.Second,
+			nonces:       []uint64{0, 1},
+			confirmedIds: []uint{0},
 		},
 	}
 	for _, test := range testCases {
@@ -169,8 +171,8 @@ func TestSend(t *testing.T) {
 			t.Parallel()
 
 			conf := configWithNumConfs(1)
-			conf.ReceiptQueryInterval = 1 * time.Second // simulate a network send
-			conf.ResubmissionTimeout = 2 * time.Second  // resubmit to detect errors
+			conf.ReceiptQueryInterval = 1 * time.Second            // simulate a network send
+			conf.ResubmissionTimeout.Store(int64(2 * time.Second)) // resubmit to detect errors
 			conf.SafeAbortNonceTooLowCount = 1
 			backend := newMockBackendWithNonce(newGasPricer(3))
 			mgr := &SimpleTxManager{
@@ -178,15 +180,22 @@ func TestSend(t *testing.T) {
 				name:    "TEST",
 				cfg:     conf,
 				backend: backend,
-				l:       testlog.Logger(t, log.LvlCrit),
+				l:       testlog.Logger(t, log.LevelCrit),
 				metr:    &metrics.NoopTxMetrics{},
 			}
 
 			// track the nonces, and return any expected errors from tx sending
-			var nonces []uint64
+			var (
+				nonces       []uint64
+				nonceForTxId map[uint]uint64 // maps from txid to nonce
+				nonceMu      sync.Mutex
+			)
+			nonceForTxId = make(map[uint]uint64)
 			sendTx := func(ctx context.Context, tx *types.Transaction) error {
 				index := int(tx.Data()[0])
+				nonceMu.Lock()
 				nonces = append(nonces, tx.Nonce())
+				nonceMu.Unlock()
 				var testTx *testTx
 				if index < len(test.txs) {
 					testTx = &test.txs[index]
@@ -194,8 +203,12 @@ func TestSend(t *testing.T) {
 				if testTx != nil && testTx.sendErr {
 					return core.ErrNonceTooLow
 				}
+
 				txHash := tx.Hash()
-				backend.mine(&txHash, tx.GasFeeCap())
+				nonceMu.Lock()
+				backend.mine(&txHash, tx.GasFeeCap(), nil)
+				nonceForTxId[uint(index)] = tx.Nonce()
+				nonceMu.Unlock()
 				return nil
 			}
 			backend.setTxSender(sendTx)
@@ -205,35 +218,49 @@ func TestSend(t *testing.T) {
 			queue := NewQueue[int](ctx, mgr, test.max)
 
 			// make all the queue calls given in the test case
-			start := time.Now()
+			receiptChs := make([]chan TxReceipt[int], len(test.calls))
 			for i, c := range test.calls {
 				msg := fmt.Sprintf("Call %d", i)
-				c := c
-				receiptCh := make(chan TxReceipt[int], 1)
 				candidate := TxCandidate{
 					TxData: []byte{byte(i)},
 					To:     &common.Address{},
 				}
-				queued := c.call(i, candidate, receiptCh, queue)
+				if i == 0 {
+					// Make the first tx much larger to expose
+					// any race conditions in the queue
+					candidate.TxData = make([]byte, 100_000)
+				}
+				receiptChs[i] = make(chan TxReceipt[int], 1)
+				queued := c.call(i, candidate, receiptChs[i], queue)
 				require.Equal(t, c.queued, queued, msg)
-				go func() {
-					r := <-receiptCh
-					if c.txErr {
-						require.Error(t, r.Err, msg)
-					} else {
-						require.NoError(t, r.Err, msg)
-					}
-				}()
 			}
 			// wait for the queue to drain (all txs complete or failed)
-			queue.Wait()
-			duration := time.Since(start)
-			// expect the execution time within a certain window
-			now := time.Now()
-			require.WithinDuration(t, now.Add(test.total), now.Add(duration), 500*time.Millisecond, "unexpected queue transaction timing")
-			// check that the nonces match
+			_ = queue.Wait()
+
+			// NOTE the backend in this test does not order transactions based on the nonce
+			// So what we want to check is that the txs match expectations when they are ordered
+			// in the same way as the nonces.
 			slices.Sort(nonces)
 			require.Equal(t, test.nonces, nonces, "expected nonces do not match")
+			for i, id := range test.confirmedIds {
+				require.Equal(t, nonces[i], nonceForTxId[id],
+					"nonce for tx id %d was %d instead of %d", id, nonceForTxId[id], nonces[i])
+			}
+
+			// check receipts
+			for i, c := range test.calls {
+				if !c.queued {
+					// non-queued txs won't have a tx result
+					continue
+				}
+				msg := fmt.Sprintf("Receipt %d", i)
+				r := <-receiptChs[i]
+				if c.txErr {
+					require.Error(t, r.Err, msg)
+				} else {
+					require.NoError(t, r.Err, msg)
+				}
+			}
 		})
 	}
 }
